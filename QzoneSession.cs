@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace Alife.Demo.Plugin.Qzone;
+namespace AinaLife.Qzone;
 
 /// <summary>QQ登录上下文构建器</summary>
 public static class QzoneSession
