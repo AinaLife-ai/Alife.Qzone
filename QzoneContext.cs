@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace Alife.Demo.Plugin.Qzone;
+namespace AinaLife.Qzone;
 
 /// <summary>QQ空间请求上下文，封装动态参数</summary>
 public class QzoneContext
