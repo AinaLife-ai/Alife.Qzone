@@ -1,2 +1,18 @@
-'{
-display_name
+{
+  "display_name": "Qzone",
+  "plugin_id": "Qzone",
+  "version": "4.2.0",
+  "author": "AinaLife-ai",
+  "icon": "",
+  "tags": [
+    "qzone",
+    "qq",
+    "social"
+  ],
+  "description": "QQ空间插件：发布说说、查看动态、点赞、评论、删除、访客统计",
+  "repo": "https://github.com/AinaLife-ai/Alife.Qzone",
+  "Version": "4.2.0",
+  "Dependencies": {
+    "Alife.Function.FunctionCaller": ""
+  }
+}
