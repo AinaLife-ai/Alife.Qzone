@@ -8,11 +8,25 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace Alife.Demo.Plugin.Qzone;
+namespace AinaLife.Qzone;
 
-/// <summary>QQ空间响应解析器</summary>
+/// <summary>QQ空间响应解析器（完整移植自 KiraAI_qzone_plugin）</summary>
 public static class QzoneParser
 {
+    /// <summary>规范化说说tid：剥离unikey形式、剥离.311/.1等appid后缀</summary>
+    public static string NormalizeTid(string? tid)
+    {
+        var s = tid?.Trim() ?? "";
+        if (string.IsNullOrEmpty(s)) return s;
+        if (s.Contains("/mood/")) s = s.Split("/mood/", 2)[1];
+        if (s.Contains('.'))
+        {
+            var idx = s.LastIndexOf('.');
+            if (idx > 0 && s[(idx + 1)..].All(char.IsDigit)) s = s[..idx];
+        }
+        return s;
+    }
+
     /// <summary>解析JSON/JSONP/非标准JSON响应</summary>
     public static Dictionary<string, object?> ParseResponse(string text)
     {
@@ -179,38 +193,246 @@ public static class QzoneParser
         return posts;
     }
 
-    /// <summary>解析评论列表</summary>
+    /// <summary>解析评论列表（含楼中楼list_3扁平化）</summary>
     public static List<QzoneComment> ParseComments(List<object?> cmtList)
     {
         var comments = new List<QzoneComment>();
         foreach (var item in cmtList)
         {
             if (item is not Dictionary<string, object?> raw) continue;
-            var rawTid = raw.GetValueOrDefault("tid")?.ToString() ?? raw.GetValueOrDefault("id")?.ToString() ?? "";
-            var commentId = raw.GetValueOrDefault("commentid")?.ToString()
-                ?? raw.GetValueOrDefault("comment_id")?.ToString()
-                ?? raw.GetValueOrDefault("cid")?.ToString()
-                ?? raw.GetValueOrDefault("commentId")?.ToString()
-                ?? rawTid;
-            int tidInt = 0;
-            int.TryParse(rawTid, out tidInt);
-
-            var cmt = new QzoneComment
+            comments.Add(ParseComment(raw, null));
+            if (raw.TryGetValue("list_3", out var subObj) && subObj is List<object?> subList)
             {
-                Uin = Convert.ToInt64(raw.GetValueOrDefault("uin") ?? 0),
-                Nickname = raw.GetValueOrDefault("name")?.ToString() ?? "",
-                Content = raw.GetValueOrDefault("content")?.ToString() ?? "",
-                CreateTime = Convert.ToInt64(raw.GetValueOrDefault("create_time") ?? raw.GetValueOrDefault("ctime") ?? 0),
-                CreateTimeStr = raw.GetValueOrDefault("createTimeStr")?.ToString() ?? "",
-                Tid = tidInt,
-                CommentId = commentId,
-                ParentTid = raw.TryGetValue("parent_tid", out var pt) && pt != null ? Convert.ToInt32(pt) : null,
-                SourceName = raw.GetValueOrDefault("source_name")?.ToString() ?? "",
-                SourceUrl = raw.GetValueOrDefault("source_url")?.ToString() ?? "",
-            };
-            comments.Add(cmt);
+                var mainTid = Convert.ToInt32(raw.GetValueOrDefault("tid") ?? 0);
+                foreach (var sub in subList)
+                {
+                    if (sub is Dictionary<string, object?> subRaw)
+                        comments.Add(ParseComment(subRaw, mainTid));
+                }
+            }
         }
         return comments;
+    }
+
+    private static QzoneComment ParseComment(Dictionary<string, object?> raw, int? parentTid)
+    {
+        var rawTid = raw.GetValueOrDefault("tid")?.ToString() ?? raw.GetValueOrDefault("id")?.ToString() ?? "";
+        var commentId = raw.GetValueOrDefault("commentid")?.ToString()
+            ?? raw.GetValueOrDefault("comment_id")?.ToString()
+            ?? raw.GetValueOrDefault("cid")?.ToString()
+            ?? raw.GetValueOrDefault("commentId")?.ToString()
+            ?? rawTid;
+        int tidInt = 0;
+        int.TryParse(rawTid, out tidInt);
+
+        return new QzoneComment
+        {
+            Uin = Convert.ToInt64(raw.GetValueOrDefault("uin") ?? 0),
+            Nickname = raw.GetValueOrDefault("name")?.ToString() ?? "",
+            Content = raw.GetValueOrDefault("content")?.ToString() ?? "",
+            CreateTime = Convert.ToInt64(raw.GetValueOrDefault("create_time") ?? raw.GetValueOrDefault("ctime") ?? 0),
+            CreateTimeStr = raw.GetValueOrDefault("createTime2")?.ToString() ?? raw.GetValueOrDefault("createTimeStr")?.ToString() ?? "",
+            Tid = tidInt,
+            CommentId = commentId,
+            ParentTid = parentTid ?? (raw.TryGetValue("parent_tid", out var pt) && pt != null ? Convert.ToInt32(pt) : null),
+            SourceName = raw.GetValueOrDefault("source_name")?.ToString() ?? "",
+            SourceUrl = raw.GetValueOrDefault("source_url")?.ToString() ?? "",
+        };
+    }
+
+    /// <summary>解析访客列表为可读文本</summary>
+    public static string ParseVisitors(Dictionary<string, object?> raw, int maxItems = 20)
+    {
+        var data = raw.GetValueOrDefault("data") as Dictionary<string, object?>;
+        var items = data?.GetValueOrDefault("items") as List<object?>;
+        if (items == null || items.Count == 0)
+            return "### 最近来访明细\n\n暂无访客记录";
+        maxItems = Math.Max(1, maxItems);
+        items = items.Take(maxItems).ToList();
+
+        var srcMap = new Dictionary<int, string>
+        {
+            [0] = "访问空间",
+            [13] = "查看动态",
+            [32] = "手机QQ",
+            [41] = "国际版QQ/TIM",
+        };
+
+        var lines = new List<string> { "\n### 最近来访明细\n", "| 时间 | 访客 | 来源 | 状态 | 带来了 |", "| --- | --- | --- | --- | --- |" };
+        foreach (var item in items)
+        {
+            if (item is not Dictionary<string, object?> v) continue;
+            var ts = Convert.ToInt64(v.GetValueOrDefault("time") ?? 0);
+            var dt = DateTimeOffset.FromUnixTimeSeconds(ts).LocalDateTime.ToString("MM-dd HH:mm");
+            var name = v.GetValueOrDefault("name")?.ToString();
+            var visitor = SafeCell(string.IsNullOrEmpty(name) ? "匿名" : name, 16);
+            var srcVal = v.GetValueOrDefault("src");
+            var srcKey = srcVal is int i ? i : -1;
+            var src = SafeCell(srcMap.GetValueOrDefault(srcKey, $"未知({srcKey})"), 12);
+            var statusParts = new List<string>();
+            if (v.GetValueOrDefault("yellow") is int yellow && yellow > 0)
+                statusParts.Add($"LV{yellow}");
+            if (v.GetValueOrDefault("is_hide_visit") is true)
+                statusParts.Add("隐身");
+            var status = SafeCell(string.Join(" / ", statusParts), 12);
+            var remark = "-";
+            if (v.GetValueOrDefault("shuoshuoes") is List<object?> shuos)
+            {
+                foreach (var s in shuos)
+                {
+                    if (s is Dictionary<string, object?> sd && sd.GetValueOrDefault("name")?.ToString() is { Length: > 0 } title)
+                    {
+                        remark = SafeCell($"说说:{title}", 30);
+                        break;
+                    }
+                }
+            }
+            if (remark == "-" && v.GetValueOrDefault("uins") is List<object?> uins)
+            {
+                var names = new List<string>();
+                foreach (var u in uins)
+                {
+                    if (u is Dictionary<string, object?> ud && ud.GetValueOrDefault("name")?.ToString() is { Length: > 0 } n)
+                        names.Add(n);
+                }
+                if (names.Count > 0)
+                    remark = SafeCell(string.Join("、", names), 30);
+            }
+            lines.Add($"| {SafeCell(dt, 16)} | {visitor} | {src} | {status} | {remark} |");
+        }
+        var today = Convert.ToInt32(data?.GetValueOrDefault("todaycount") ?? 0);
+        var total = Convert.ToInt32(data?.GetValueOrDefault("totalcount") ?? 0);
+        lines.Add($"今日访客共 {today} 人， 最近30天访客共 {total} 人");
+        return string.Join("\n", lines);
+    }
+
+    private static string SafeCell(string? text, int maxLen = 30)
+    {
+        if (string.IsNullOrEmpty(text)) return "-";
+        text = text.Replace("\n", " ").Replace("|", "｜").Trim();
+        if (text.Length > maxLen) text = text[..maxLen] + "…";
+        return string.IsNullOrEmpty(text) ? "-" : text;
+    }
+
+    /// <summary>解析最近说说列表（feeds3_html_more，HTML解析）</summary>
+    public static List<QzonePost> ParseRecentFeeds(Dictionary<string, object?> data)
+    {
+        var feeds = (data.GetValueOrDefault("data") as Dictionary<string, object?>)?.GetValueOrDefault("data") as List<object?>;
+        if (feeds == null || feeds.Count == 0) return new();
+        var posts = new List<QzonePost>();
+        foreach (var feedObj in feeds)
+        {
+            if (feedObj is not Dictionary<string, object?> feed) continue;
+            var appid = feed.GetValueOrDefault("appid")?.ToString() ?? "";
+            if (appid != "311") continue;
+            var uin = feed.GetValueOrDefault("uin")?.ToString() ?? "";
+            var tid = feed.GetValueOrDefault("key")?.ToString() ?? "";
+            if (string.IsNullOrEmpty(uin) || string.IsNullOrEmpty(tid)) continue;
+            long createTime = 0;
+            long.TryParse(feed.GetValueOrDefault("abstime")?.ToString() ?? "", out createTime);
+            var nickname = feed.GetValueOrDefault("nickname")?.ToString() ?? "";
+            var htmlContent = feed.GetValueOrDefault("html")?.ToString() ?? "";
+            if (string.IsNullOrEmpty(htmlContent)) continue;
+
+            var text = ExtractHtmlText(htmlContent, "div", "f-info");
+            var rtCon = ExtractHtmlText(htmlContent, "div", "txt-box");
+            if (rtCon.Contains('：'))
+                rtCon = rtCon.Split('：', 2)[1].Trim();
+
+            var imageUrls = new List<string>();
+            foreach (var src in ExtractHtmlImgSrcs(htmlContent, "div", "img-box"))
+            {
+                if (!src.StartsWith("http://qzonestyle.gtimg.cn"))
+                    imageUrls.Add(src);
+            }
+            var videoImg = ExtractHtmlFirstImgSrc(htmlContent, "div", "video-img");
+            if (!string.IsNullOrEmpty(videoImg)) imageUrls.Add(videoImg);
+
+            var comments = new List<QzoneComment>();
+            foreach (var itemHtml in ExtractHtmlItems(htmlContent, "li", "comments-item"))
+            {
+                var dataUin = ExtractAttr(itemHtml, "data-uin");
+                var dataTid = ExtractAttr(itemHtml, "data-tid");
+                var dataNick = ExtractAttr(itemHtml, "data-nick");
+                var content = ExtractHtmlText(itemHtml, "div", "comments-content");
+                if (content.Contains(':'))
+                    content = content.Split(':', 2)[1].Trim();
+                var timeStr = ExtractHtmlText(itemHtml, "span", "state");
+                int? parentTid = null;
+                if (itemHtml.Contains("mod-comments-sub"))
+                    parentTid = ExtractParentTid(itemHtml);
+                long.TryParse(dataUin, out var cUin);
+                int.TryParse(dataTid, out var cTid);
+                comments.Add(new QzoneComment
+                {
+                    Uin = cUin,
+                    Nickname = dataNick,
+                    Content = content,
+                    CreateTimeStr = timeStr,
+                    Tid = cTid,
+                    ParentTid = parentTid,
+                });
+            }
+
+            posts.Add(new QzonePost
+            {
+                Tid = tid,
+                Uin = long.TryParse(uin, out var u) ? u : 0,
+                Name = nickname,
+                Text = text,
+                Images = imageUrls.Distinct().ToList(),
+                CreateTime = createTime,
+                RtCon = rtCon,
+                Comments = comments,
+            });
+        }
+        return posts;
+    }
+
+    // ---------- 简易HTML解析（feeds3_html_more 返回的是HTML片段） ----------
+
+    private static string ExtractHtmlText(string html, string tag, string className)
+    {
+        var m = Regex.Match(html, $@"<{tag}[^>]*class=[""'][^""']*{className}[^""']*[""'][^>]*>(.*?)</{tag}>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        if (!m.Success) return "";
+        return Regex.Replace(m.Groups[1].Value, @"<[^>]+>", "").Trim();
+    }
+
+    private static List<string> ExtractHtmlImgSrcs(string html, string tag, string className)
+    {
+        var result = new List<string>();
+        var m = Regex.Match(html, $@"<{tag}[^>]*class=[""'][^""']*{className}[^""']*[""'][^>]*>(.*?)</{tag}>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        if (!m.Success) return result;
+        foreach (Match img in Regex.Matches(m.Groups[1].Value, @"<img[^>]*src=[""'](?<src>[^""']+)[""']", RegexOptions.IgnoreCase))
+            result.Add(img.Groups["src"].Value);
+        return result;
+    }
+
+    private static string ExtractHtmlFirstImgSrc(string html, string tag, string className)
+    {
+        var m = Regex.Match(html, $@"<{tag}[^>]*class=[""'][^""']*{className}[^""']*[""'][^>]*>\s*<img[^>]*src=[""'](?<src>[^""']+)[""']", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups["src"].Value : "";
+    }
+
+    private static List<string> ExtractHtmlItems(string html, string tag, string className)
+    {
+        var result = new List<string>();
+        foreach (Match m in Regex.Matches(html, $@"<{tag}[^>]*class=[""'][^""']*{className}[^""']*[""'][^>]*>.*?</{tag}>", RegexOptions.Singleline | RegexOptions.IgnoreCase))
+            result.Add(m.Value);
+        return result;
+    }
+
+    private static string ExtractAttr(string html, string attr)
+    {
+        var m = Regex.Match(html, $@"{attr}=[""'](?<v>[^""']*)[""']", RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups["v"].Value : "";
+    }
+
+    private static int? ExtractParentTid(string itemHtml)
+    {
+        // 楼中回复：向上找父级 li.comments-item 的 data-tid
+        var m = Regex.Match(itemHtml, @"<li[^>]*class=[""'][^""']*comments-item[^""']*[""'][^>]*data-tid=[""'](?<tid>\d+)[""']", RegexOptions.IgnoreCase);
+        return m.Success ? int.Parse(m.Groups["tid"].Value) : null;
     }
 
     /// <summary>格式化时间戳</summary>
@@ -234,7 +456,7 @@ public static class QzoneParser
         return bytes;
     }
 
-    /// <summary>规范化图片列表，返回字节数组列表</summary>
+    /// <summary>规范化图片列表，返回字节数组列表（校验图片魔数）</summary>
     public static async Task<List<byte[]>> NormalizeImagesAsync(List<string> images, List<string>? errors = null, CancellationToken ct = default)
     {
         errors ??= new List<string>();
@@ -245,11 +467,23 @@ public static class QzoneParser
             {
                 if (img.StartsWith("http://") || img.StartsWith("https://"))
                 {
-                    result.Add(await DownloadImageAsync(img, ct));
+                    var data = await DownloadImageAsync(img, ct);
+                    if (!LooksLikeImage(data))
+                    {
+                        errors.Add($"下载内容不是图片（链接可能已过期返回错误页）: {img[..Math.Min(80, img.Length)]}");
+                        continue;
+                    }
+                    result.Add(data);
                 }
                 else if (File.Exists(img))
                 {
-                    result.Add(await File.ReadAllBytesAsync(img, ct));
+                    var data = await File.ReadAllBytesAsync(img, ct);
+                    if (!LooksLikeImage(data))
+                    {
+                        errors.Add($"本地文件内容不是图片: {img}");
+                        continue;
+                    }
+                    result.Add(data);
                 }
                 else
                 {
@@ -262,5 +496,32 @@ public static class QzoneParser
             }
         }
         return result;
+    }
+
+    private static readonly byte[][] ImageMagic = {
+        new byte[] { 0xFF, 0xD8, 0xFF },          // JPEG
+        new byte[] { 0x89, 0x50, 0x4E, 0x47 },     // PNG
+        new byte[] { 0x47, 0x49, 0x46, 0x38 },     // GIF
+        new byte[] { 0x52, 0x49, 0x46, 0x46 },     // WebP/RIFF
+        new byte[] { 0x42, 0x4D },                 // BMP
+    };
+
+    /// <summary>校验下载内容是否为图片</summary>
+    public static bool LooksLikeImage(byte[] data)
+    {
+        if (data == null || data.Length < 12) return false;
+        foreach (var magic in ImageMagic)
+        {
+            if (data.Length >= magic.Length)
+            {
+                bool match = true;
+                for (int i = 0; i < magic.Length; i++)
+                {
+                    if (data[i] != magic[i]) { match = false; break; }
+                }
+                if (match) return true;
+            }
+        }
+        return false;
     }
 }
