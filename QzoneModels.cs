@@ -1,15 +1,15 @@
 using System;
 using System.Collections.Generic;
-using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
-namespace Alife.Demo.Plugin.Qzone;
+namespace AinaLife.Qzone;
 
 /// <summary>统一接口响应结果</summary>
 public class ApiResponse
 {
     public bool Ok { get; }
     public int Code { get; }
-    public string? Message { get; }
+    public string? Message { get; set; }
     public Dictionary<string, object?> Data { get; }
     public Dictionary<string, object?> Raw { get; }
 
@@ -50,6 +50,17 @@ public class ApiResponse
             }
         }
         message ??= code.ToString();
+
+        // 兼容 ret=0 成功（部分接口返回 ret 而非 code）
+        if (code != successCode && raw.TryGetValue("ret", out var retVal))
+        {
+            try
+            {
+                if (Convert.ToInt32(retVal) == successCode)
+                    code = successCode;
+            }
+            catch { }
+        }
 
         if (code == successCode)
         {
@@ -118,5 +129,5 @@ public class QzoneComment
     public string SourceName { get; set; } = "";
     public string SourceUrl { get; set; } = "";
 
-    public string PlainContent => System.Text.RegularExpressions.Regex.Replace(Content, @"\[em\].*?\[/em\]", "");
+    public string PlainContent => Regex.Replace(Content, @"\[em\].*?\[/em\]", "");
 }
