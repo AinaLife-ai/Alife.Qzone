@@ -38,7 +38,13 @@ public class QzoneHttpClient : IDisposable
         _logger = logger;
         _ctxProvider = ctxProvider;
         // UseCookies=false：禁止自动保存响应 Set-Cookie，防旧 Cookie 残留（对齐 DummyCookieJar）
-        _http = new HttpClient(new HttpClientHandler { UseCookies = false });
+        // SslProtocols：老 Windows 默认可能协商 TLS1.0/1.1 被腾讯服务器拒绝（报 SSL 连接错误），显式指定 TLS1.2+
+        _http = new HttpClient(new HttpClientHandler
+        {
+            UseCookies = false,
+            SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13,
+            AutomaticDecompression = System.Net.DecompressionMethods.All
+        });
     }
 
     public async Task<Dictionary<string, object?>> RequestAsync(

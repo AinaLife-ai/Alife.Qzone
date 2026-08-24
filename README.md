@@ -64,6 +64,7 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 | TaskGroupIds / TaskPrivateIds | 定时任务指令场合（群号/QQ号，逗号分隔，随机选一个） |
 | TaskMessageStyle | silent=提示AI不向群/私聊发回复（无痕）；notify=不限制 |
 | AutoAttachRecentImage | 吸附模式：发说说未指定图片时自动抓最近一张图 |
+| ImageLocalPathWhitelist | 本地图片目录白名单：允许AI读取的本地图片目录（绝对路径，英文逗号分隔，如 D:\\ComfyUI\\output）；留空=全部允许。用于 ComfyUI 等本地产图 |
 
 ## 工具函数
 

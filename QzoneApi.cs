@@ -85,7 +85,8 @@ public class QzoneApi
     }
 
     /// <summary>发布说说。allowImageDrop=true 时配图全部获取失败降级为纯文字发布而不是整个失败。</summary>
-    public async Task<ApiResponse> PublishAsync(string text, List<string>? images = null, bool allowImageDrop = false, CancellationToken ct = default)
+    public async Task<ApiResponse> PublishAsync(string text, List<string>? images = null, bool allowImageDrop = false,
+        Func<string, bool>? allowLocalPath = null, CancellationToken ct = default)
     {
         var data = new Dictionary<string, string>
         {
@@ -108,7 +109,7 @@ public class QzoneApi
         {
             var picBos = new List<string>();
             var richVals = new List<string>();
-            var imgs = await QzoneParser.NormalizeImagesAsync(images, downloadErrors, ct);
+            var imgs = await QzoneParser.NormalizeImagesAsync(images, downloadErrors, allowLocalPath, ct);
             if (imgs.Count == 0)
             {
                 if (allowImageDrop)

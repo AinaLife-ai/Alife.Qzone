@@ -179,6 +179,10 @@ public class QzoneConfig
     [DisplayName("吸附模式")]
     [Description("发说说未指定图片时自动抓最近一张图（开启则关闭清单机制，失败降级纯文字）")]
     public bool AutoAttachRecentImage { get; set; } = false;
+
+    [DisplayName("本地图片目录白名单")]
+    [Description("允许AI读取本地图片文件的目录（绝对路径文件夹，英文逗号隔开，如 D:\\ComfyUI\\output,C:\\pics）；留空=全部允许。用于ComfyUI等本地产图工具")]
+    public string ImageLocalPathWhitelist { get; set; } = "";
 }
 
 [Module("QQ空间",
@@ -196,6 +200,23 @@ public class QzoneModule(
     public QzoneConfig Configuration { get; set; } = null!;
 
     // QChatService 未公开 OneBotClient（官方源码字段名 oneBotClient），通过反射获取（不修改官方代码）
+    /// <summary>本地图片路径白名单校验。留空=全部允许；否则必须位于任一白名单目录内（含子目录）。</summary>
+    private bool IsLocalImagePathAllowed(string fullPath)
+    {
+        if (string.IsNullOrWhiteSpace(Configuration.ImageLocalPathWhitelist)) return true;
+        foreach (var d0 in Configuration.ImageLocalPathWhitelist.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            try
+            {
+                var dir = Path.GetFullPath(d0.Trim().Trim('"', '\''));
+                var prefix = dir.EndsWith(Path.DirectorySeparatorChar) ? dir : dir + Path.DirectorySeparatorChar;
+                if (fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            catch { }
+        }
+        return false;
+    }
+
     private OneBotClient? GetClient()
     {
         var field = typeof(QChatService).GetField("oneBotClient",
@@ -1133,7 +1154,7 @@ public class QzoneModule(
             return;
         }
 
-        var result = await _api!.PublishAsync(finalText, imageUrls, allowImageDrop: true);
+        var result = await _api!.PublishAsync(finalText, imageUrls, allowImageDrop: true, allowLocalPath: IsLocalImagePathAllowed);
         if (result.Ok)
         {
             _state.MyPostsHistory.Add(finalText);
@@ -1701,7 +1722,7 @@ public class QzoneModule(
                 }
             }
 
-            var result = await _api!.PublishAsync(text, imgList, allowImageDrop: imgList.Count > 0);
+            var result = await _api!.PublishAsync(text, imgList, allowImageDrop: imgList.Count > 0, allowLocalPath: IsLocalImagePathAllowed);
             if (result.Ok)
             {
                 _state.MyPostsHistory.Add(text);

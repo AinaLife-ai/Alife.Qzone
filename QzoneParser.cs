@@ -495,13 +495,20 @@ public static class QzoneParser
         return url;
     }
 
-    /// <summary>规范化图片列表，返回字节数组列表（校验图片魔数）</summary>
-    public static async Task<List<byte[]>> NormalizeImagesAsync(List<string> images, List<string>? errors = null, CancellationToken ct = default)
+    /// <summary>
+    /// 规范化图片列表，返回字节数组列表（校验图片魔数）。
+    /// 本地路径支持：正反斜杠、含空格目录、首尾引号、file:// URI；allowLocalPath 非空时做目录白名单校验。
+    /// </summary>
+    public static async Task<List<byte[]>> NormalizeImagesAsync(List<string> images, List<string>? errors = null,
+        Func<string, bool>? allowLocalPath = null, CancellationToken ct = default)
     {
         errors ??= new List<string>();
         var result = new List<byte[]>();
-        foreach (var img in images)
+        foreach (var raw in images)
         {
+            // 剥离首尾空白与引号（AI 传参常带引号）
+            var img = (raw ?? "").Trim().Trim('"', '\'');
+            if (img.Length == 0) continue;
             try
             {
                 if (img.StartsWith("http://") || img.StartsWith("https://"))
@@ -519,19 +526,32 @@ public static class QzoneParser
                     }
                     result.Add(data);
                 }
-                else if (File.Exists(img))
+                else
                 {
-                    var data = await File.ReadAllBytesAsync(img, ct);
+                    // 本地文件路径（如 D:\ComfyUI\output\x.png / /home/u/pic.png / file:///D:/x.png）
+                    var path = img;
+                    if (path.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { path = new Uri(path).LocalPath; } catch { }
+                    }
+                    try { path = Path.GetFullPath(path); } catch { }
+                    if (allowLocalPath != null && !allowLocalPath(path))
+                    {
+                        errors.Add($"本地图片路径不在白名单目录内（见插件配置「本地图片目录白名单」）: {path}");
+                        continue;
+                    }
+                    if (!File.Exists(path))
+                    {
+                        errors.Add($"本地图片文件不存在: {path}");
+                        continue;
+                    }
+                    var data = await File.ReadAllBytesAsync(path, ct);
                     if (!LooksLikeImage(data))
                     {
-                        errors.Add($"本地文件内容不是图片: {img}");
+                        errors.Add($"本地文件内容不是图片: {path}");
                         continue;
                     }
                     result.Add(data);
-                }
-                else
-                {
-                    errors.Add($"无法识别的图片: {img}");
                 }
             }
             catch (Exception e)
