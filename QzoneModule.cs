@@ -493,10 +493,10 @@ public class QzoneModule(
             string? newCookie = null;
             try
             {
-                // 固定 5s 快速超时（对齐 Kira：快速失败，不受插件 Timeout 影响）
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                // 注意：Alife 的 CallActionAsync<T> 返回的是 OneBot 响应的 data 字段本身（已解包），
+                // 且内置固定 10s 超时快速失败。domain 对齐 Kira：user.qzone.qq.com
                 var data = await client.CallActionAsync<JsonElement>("get_cookies", new { domain = "user.qzone.qq.com" });
-                if (data.TryGetProperty("data", out var d) && d.TryGetProperty("cookies", out var c))
+                if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("cookies", out var c))
                     newCookie = c.GetString();
             }
             catch (Exception e)
@@ -946,7 +946,7 @@ public class QzoneModule(
                     {
                         var info = await client.CallActionAsync<JsonElement>("get_group_info", new { group_id = long.Parse(id) });
                         var name = "";
-                        if (info.TryGetProperty("data", out var d) && d.TryGetProperty("group_name", out var n))
+                        if (info.ValueKind == JsonValueKind.Object && info.TryGetProperty("group_name", out var n))
                             name = n.GetString() ?? "";
                         instruction += string.IsNullOrEmpty(name) ? $"\n（当前场合：群 {id}）" : $"\n（当前场合：群「{name}」{id}）";
                     }
@@ -954,7 +954,7 @@ public class QzoneModule(
                     {
                         var info = await client.CallActionAsync<JsonElement>("get_stranger_info", new { user_id = long.Parse(id) });
                         var name = "";
-                        if (info.TryGetProperty("data", out var d) && d.TryGetProperty("nickname", out var n))
+                        if (info.ValueKind == JsonValueKind.Object && info.TryGetProperty("nickname", out var n))
                             name = n.GetString() ?? "";
                         instruction += string.IsNullOrEmpty(name) ? $"\n（当前场合：与 {id} 的私聊）" : $"\n（当前场合：与「{name}」{id} 的私聊）";
                     }
@@ -1284,7 +1284,7 @@ public class QzoneModule(
         var key = sourceType == "group" ? "group_id" : "user_id";
         var result = await client.CallActionAsync<JsonElement>(action, new Dictionary<string, object> { [key] = long.Parse(sourceId), ["count"] = count });
         var messages = new List<JsonElement>();
-        if (result.TryGetProperty("data", out var d) && d.TryGetProperty("messages", out var msgs))
+        if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("messages", out var msgs))
         {
             foreach (var m in msgs.EnumerateArray()) messages.Add(m);
         }
@@ -1413,7 +1413,7 @@ public class QzoneModule(
             var client = GetClient();
             if (client == null) return false;
             var result = await client.CallActionAsync<JsonElement>("get_msg", new { message_id = long.Parse(entry.MsgId) });
-            if (result.TryGetProperty("data", out var d) && d.TryGetProperty("message", out var segs)
+            if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("message", out var segs)
                 && segs.ValueKind == JsonValueKind.Array)
             {
                 foreach (var seg in segs.EnumerateArray())
@@ -1875,7 +1875,7 @@ public class QzoneModule(
             if (client != null)
             {
                 var info = await client.CallActionAsync<JsonElement>("get_stranger_info", new { user_id = _myUin });
-                if (info.TryGetProperty("data", out var d) && d.TryGetProperty("nickname", out var n))
+                if (info.ValueKind == JsonValueKind.Object && info.TryGetProperty("nickname", out var n))
                 {
                     _myNickname = n.GetString() ?? "";
                     if (!string.IsNullOrEmpty(_myNickname)) return _myNickname;
