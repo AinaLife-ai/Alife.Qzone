@@ -55,41 +55,87 @@ public static class QzoneParser
 
         jsonStr = jsonStr.Replace("undefined", "null").Trim();
 
+        // 直接走宽松解析（对齐 Kira 的 json5 行为）：QZone 大量接口（尤其 H5 format=fs）
+        // 返回非标准 JSON。宽松化用引号状态机实现，只在双引号字符串外做转换，
+        // 对标准 JSON 与正文中的撇号（如 "I'm"）完全无副作用。
         try
         {
-            var doc = JsonDocument.Parse(jsonStr);
+            var doc = JsonDocument.Parse(ToLenientJson(jsonStr));
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
                 return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
             return JsonToDict(doc.RootElement);
         }
         catch (JsonException)
         {
-            // QZone 部分接口（尤其 format=fs 的 H5 路径）返回非标准 JSON：单引号字符串、无引号键、尾随逗号。
-            // Kira 用 json5 容忍这些；这里做一次宽松化预处理后重试（对齐 json5 行为）。
-            try
-            {
-                var doc = JsonDocument.Parse(ToLenientJson(jsonStr));
-                if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                    return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
-                return JsonToDict(doc.RootElement);
-            }
-            catch (JsonException)
-            {
-                return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
-            }
+            return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
         }
     }
 
-    /// <summary>非标准 JSON 宽松化：无引号键补引号、单引号转双引号、去尾随逗号（对齐 Kira 的 json5 解析）。</summary>
+    /// <summary>
+    /// 非标准 JSON 宽松化（引号状态机版）：双引号字符串外才做转换——
+    /// 单引号字符串转双引号（内部双引号转义）、{key: / ,key: 无引号键补引号、去尾随逗号。
+    /// </summary>
     private static string ToLenientJson(string s)
     {
-        // 单引号字符串 → 双引号（先处理，避免后续键名规则误伤）
-        s = Regex.Replace(s, @"'((?:[^'\\]|\\.)*)'", m => "\"" + m.Groups[1].Value.Replace("\"", "\\\"") + "\"");
-        // 无引号键名补引号：{key: 或 ,key:
-        s = Regex.Replace(s, @"([\{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", "$1\"$2\":");
-        // 尾随逗号：,} 或 ,]
-        s = Regex.Replace(s, @",\s*([}\]])", "$1");
-        return s;
+        var sb = new System.Text.StringBuilder(s.Length + 16);
+        bool inDouble = false;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inDouble)
+            {
+                sb.Append(c);
+                if (c == '\\' && i + 1 < s.Length) sb.Append(s[++i]); // 保留转义对
+                else if (c == '"') inDouble = false;
+                continue;
+            }
+            if (c == '"') { inDouble = true; sb.Append(c); continue; }
+            if (c == '\'')
+            {
+                // 单引号字符串 → 双引号（内部未转义双引号补转义；\' 还原为 '）
+                sb.Append('"');
+                for (i++; i < s.Length; i++)
+                {
+                    char sc = s[i];
+                    if (sc == '\\' && i + 1 < s.Length)
+                    {
+                        char nx = s[i + 1];
+                        if (nx == '\'') { sb.Append('\''); i++; continue; }
+                        sb.Append(sc); sb.Append(nx); i++; continue;
+                    }
+                    if (sc == '\'') break;
+                    if (sc == '"') sb.Append('\\');
+                    sb.Append(sc);
+                }
+                sb.Append('"');
+                continue;
+            }
+            if (c == '{' || c == ',')
+            {
+                // 向前看：{ 或 , 后是空白+标识符+冒号 → 无引号键，补引号
+                int j = i + 1;
+                while (j < s.Length && char.IsWhiteSpace(s[j])) j++;
+                int k = j;
+                while (k < s.Length && (char.IsLetterOrDigit(s[k]) || s[k] == '_')) k++;
+                int m = k;
+                while (m < s.Length && char.IsWhiteSpace(s[m])) m++;
+                if (k > j && m < s.Length && s[m] == ':')
+                {
+                    sb.Append(c).Append(s, i + 1, j - i - 1);
+                    sb.Append('"').Append(s, j, k - j).Append('"');
+                    sb.Append(s, k, m - k).Append(':');
+                    i = m;
+                    continue;
+                }
+                // 去尾随逗号：, 后（跨空白）直接是 } 或 ]
+                if (c == ',' && j < s.Length && (s[j] == '}' || s[j] == ']'))
+                    continue; // 丢弃此逗号
+                sb.Append(c);
+                continue;
+            }
+            sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     private static Dictionary<string, object?> JsonToDict(JsonElement el)
