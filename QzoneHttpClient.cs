@@ -32,19 +32,27 @@ public class QzoneHttpClient : IDisposable
     public Func<Task<bool>>? OnAuthExpired { get; set; }
 
     /// <param name="ctxProvider">每次请求取最新上下文（Cookie 原地刷新后自动生效）。</param>
-    public QzoneHttpClient(int timeoutSeconds, ILogger logger, Func<QzoneContext> ctxProvider)
+    public QzoneHttpClient(int timeoutSeconds, ILogger logger, Func<QzoneContext> ctxProvider,
+        Func<bool>? insecureSslProvider = null)
     {
         _defaultTimeoutSeconds = timeoutSeconds;
         _logger = logger;
         _ctxProvider = ctxProvider;
         // UseCookies=false：禁止自动保存响应 Set-Cookie，防旧 Cookie 残留（对齐 DummyCookieJar）
         // SslProtocols：老 Windows 默认可能协商 TLS1.0/1.1 被腾讯服务器拒绝（报 SSL 连接错误），显式指定 TLS1.2+
-        _http = new HttpClient(new HttpClientHandler
+        var handler = new HttpClientHandler
         {
             UseCookies = false,
             SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13,
             AutomaticDecompression = System.Net.DecompressionMethods.All
-        });
+        };
+        if (insecureSslProvider != null)
+        {
+            // 动态读取配置：证书有效时正常校验，仅当配置开启「忽略SSL证书校验」时放行（本机代理/VPN/抓包拦截场景）
+            handler.ServerCertificateCustomValidationCallback = (_, _, _, errors) =>
+                errors == System.Net.Security.SslPolicyErrors.None || insecureSslProvider();
+        }
+        _http = new HttpClient(handler);
     }
 
     public async Task<Dictionary<string, object?>> RequestAsync(

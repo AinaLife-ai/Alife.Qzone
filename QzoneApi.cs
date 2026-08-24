@@ -14,6 +14,8 @@ public class QzoneApi
 {
     private const string BaseUrl = "https://user.qzone.qq.com";
     private const string UploadImageUrl = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image";
+    // 反代回退路径：与 emotion_cgi_publish 相同的 proxy/domain 模式，走 user.qzone.qq.com 域名
+    private const string UploadImageProxyUrl = "https://user.qzone.qq.com/proxy/domain/up.qzone.qq.com/cgi-bin/upload/cgi_upload_image";
     private const string EmotionUrl = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6";
     private const string DolikeUrl = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app";
     private const string DolikeUnlikeUrl = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_unlike_app";
@@ -49,8 +51,39 @@ public class QzoneApi
         try { return Convert.ToInt64(v) == 0; } catch { return false; }
     }
 
-    /// <summary>上传单张图片（本接口较为脆弱，给足 60s 超时）</summary>
+    /// <summary>上传单张图片（本接口较为脆弱，给足 60s 超时）。
+    /// 直连 up.qzone.qq.com 失败（如本机安全软件/代理只拦该域名的 HTTPS）时，
+    /// 自动回退到 user.qzone.qq.com 的 proxy/domain 反代路径（与发布接口同域名，同 emotion_cgi 的既有模式）。</summary>
     public async Task<ApiResponse> UploadImageAsync(byte[] image, CancellationToken ct = default)
+    {
+        try
+        {
+            var resp = await UploadImageCoreAsync(UploadImageUrl, image, ct);
+            if (resp.Ok) return resp;
+            // 业务失败也试一次反代路径（部分网络环境下直连域名被劫持返回错误页）
+            var fallback = await TryUploadViaProxyDomainAsync(image, ct);
+            return fallback ?? resp;
+        }
+        catch
+        {
+            // 连接级失败（SSL/超时/重置）：回退反代路径再试一次
+            var fallback = await TryUploadViaProxyDomainAsync(image, ct);
+            if (fallback != null) return fallback;
+            throw;
+        }
+    }
+
+    private async Task<ApiResponse?> TryUploadViaProxyDomainAsync(byte[] image, CancellationToken ct)
+    {
+        try
+        {
+            var resp = await UploadImageCoreAsync(UploadImageProxyUrl, image, ct);
+            return resp.Ok ? resp : null;
+        }
+        catch { return null; }
+    }
+
+    private async Task<ApiResponse> UploadImageCoreAsync(string url, byte[] image, CancellationToken ct)
     {
         var form = new Dictionary<string, string>
         {
@@ -75,7 +108,7 @@ public class QzoneApi
             ["base64"] = "1",
             ["picfile"] = Convert.ToBase64String(image),
         };
-        var raw = await _client.RequestAsync(HttpMethod.Post, UploadImageUrl,
+        var raw = await _client.RequestAsync(HttpMethod.Post, url,
             query: new() { ["g_tk"] = Ctx.Gtk2 },
             form: form,
             headers: new() { ["referer"] = $"{BaseUrl}/{Ctx.Uin}", ["origin"] = BaseUrl },

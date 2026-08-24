@@ -13,6 +13,8 @@ namespace AinaLife.Qzone;
 /// <summary>QQ空间响应解析器（完整移植自 KiraAI_qzone_plugin）</summary>
 public static class QzoneParser
 {
+    /// <summary>下载图片时的 SSL 放行开关（由模块配置「忽略SSL证书校验」注入）。</summary>
+    public static Func<bool>? InsecureSslProvider;
     /// <summary>空响应特征消息（传输层据此做抽风重试）</summary>
     public const string MsgEmptyResponse = "响应内容为空";
 
@@ -464,7 +466,10 @@ public static class QzoneParser
         {
             try
             {
-                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+                var handler = new HttpClientHandler { SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13 };
+                if (InsecureSslProvider?.Invoke() == true)
+                    handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+                using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
                 http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
                 // 前几次带 qzone Referer，最后一次不带（兼容外部 CDN）
                 if (attempt < maxRetries - 1)

@@ -183,6 +183,10 @@ public class QzoneConfig
     [DisplayName("本地图片目录白名单")]
     [Description("允许AI读取本地图片文件的目录（绝对路径文件夹，英文逗号隔开，如 D:\\ComfyUI\\output,C:\\pics）；留空=全部允许。用于ComfyUI等本地产图工具")]
     public string ImageLocalPathWhitelist { get; set; } = "";
+
+    [DisplayName("忽略SSL证书校验")]
+    [Description("QQ空间接口报SSL连接错误时开启（多由本机代理/VPN/抓包软件拦截HTTPS导致）。有安全风险，仅在确认网络环境后开启")]
+    public bool AllowInsecureSsl { get; set; } = false;
 }
 
 [Module("QQ空间",
@@ -200,6 +204,22 @@ public class QzoneModule(
     public QzoneConfig Configuration { get; set; } = null!;
 
     // QChatService 未公开 OneBotClient（官方源码字段名 oneBotClient），通过反射获取（不修改官方代码）
+    /// <summary>展开异常链（含 InnerException），SSL 失败时附带解决提示。</summary>
+    internal static string FmtErr(Exception e)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (var cur = e; cur != null; cur = cur.InnerException)
+        {
+            if (sb.Length > 0) sb.Append(" ← ");
+            sb.Append(cur.Message);
+        }
+        var msg = sb.ToString();
+        if (msg.Contains("SSL", StringComparison.OrdinalIgnoreCase) || msg.Contains("certificate", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("证书") || msg.Contains("Authentication", StringComparison.OrdinalIgnoreCase))
+            msg += "（SSL 握手失败：多为本机代理/VPN/抓包软件拦截 HTTPS 所致，可在插件配置开启「忽略SSL证书校验」后重试）";
+        return msg;
+    }
+
     /// <summary>本地图片路径白名单校验。留空=全部允许；否则必须位于任一白名单目录内（含子目录）。</summary>
     private bool IsLocalImagePathAllowed(string fullPath)
     {
@@ -643,7 +663,7 @@ public class QzoneModule(
         if (!_session.HasContext)
         {
             try { _session.GetCtx(); }
-            catch (Exception e) { throw new Exception($"QQ空间会话不可用：{e.Message}"); }
+            catch (Exception e) { throw new Exception($"QQ空间会话不可用：{FmtErr(e)}"); }
         }
         _myUin = _session.GetCtx().Uin;
         if (_myUin == 0)
@@ -1605,7 +1625,9 @@ public class QzoneModule(
 
         // 会话与传输层：Cookie 原地刷新，失效自救回调挂传输层
         _session = new QzoneSession(() => Configuration.CookiesStr);
-        _httpClient = new QzoneHttpClient(Configuration.Timeout, logger, () => _session.GetCtx());
+        QzoneParser.InsecureSslProvider = () => Configuration.AllowInsecureSsl;
+        _httpClient = new QzoneHttpClient(Configuration.Timeout, logger, () => _session.GetCtx(),
+            insecureSslProvider: () => Configuration.AllowInsecureSsl);
         _httpClient.OnAuthExpired = () => RefreshCookieAsync(force: true);
         _api = new QzoneApi(_session, _httpClient);
 
@@ -1739,7 +1761,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"发布失败：{e.Message}");
+            interactor.Poke($"发布失败：{FmtErr(e)}");
         }
     }
 
@@ -1879,7 +1901,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"查看失败：{e.Message}");
+            interactor.Poke($"查看失败：{FmtErr(e)}");
         }
     }
 
@@ -1978,7 +2000,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"点赞失败：{e.Message}");
+            interactor.Poke($"点赞失败：{FmtErr(e)}");
         }
     }
 
@@ -2034,7 +2056,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"评论失败：{e.Message}");
+            interactor.Poke($"评论失败：{FmtErr(e)}");
         }
     }
 
@@ -2056,7 +2078,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"删除失败：{e.Message}");
+            interactor.Poke($"删除失败：{FmtErr(e)}");
         }
     }
 
@@ -2109,7 +2131,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"删除评论失败：{e.Message}");
+            interactor.Poke($"删除评论失败：{FmtErr(e)}");
         }
     }
 
@@ -2180,7 +2202,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"回复失败：{e.Message}");
+            interactor.Poke($"回复失败：{FmtErr(e)}");
         }
     }
 
@@ -2207,7 +2229,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"获取访客失败：{e.Message}");
+            interactor.Poke($"获取访客失败：{FmtErr(e)}");
         }
     }
 
@@ -2272,7 +2294,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"识别失败：{e.Message}");
+            interactor.Poke($"识别失败：{FmtErr(e)}");
         }
     }
 
@@ -2333,7 +2355,7 @@ public class QzoneModule(
         }
         catch (Exception e)
         {
-            interactor.Poke($"获取图片清单失败：{e.Message}");
+            interactor.Poke($"获取图片清单失败：{FmtErr(e)}");
         }
     }
 
