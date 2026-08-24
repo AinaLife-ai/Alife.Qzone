@@ -13,6 +13,9 @@ namespace AinaLife.Qzone;
 /// <summary>QQ空间响应解析器（完整移植自 KiraAI_qzone_plugin）</summary>
 public static class QzoneParser
 {
+    /// <summary>空响应特征消息（传输层据此做抽风重试）</summary>
+    public const string MsgEmptyResponse = "响应内容为空";
+
     /// <summary>规范化说说tid：剥离unikey形式、剥离.311/.1等appid后缀</summary>
     public static string NormalizeTid(string? tid)
     {
@@ -31,7 +34,7 @@ public static class QzoneParser
     public static Dictionary<string, object?> ParseResponse(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
-            return new() { ["code"] = -1, ["message"] = "响应内容为空" };
+            return new() { ["code"] = -1, ["message"] = MsgEmptyResponse };
 
         string jsonStr;
         var m = Regex.Match(text, @"callback\s*\(\s*([^{]*(\{.*\})[^)]*)\s*\)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
@@ -446,14 +449,50 @@ public static class QzoneParser
         return dt.ToString("yyyy-MM-dd");
     }
 
-    /// <summary>下载图片为字节数组</summary>
-    public static async Task<byte[]> DownloadImageAsync(string url, CancellationToken ct = default)
+    /// <summary>
+    /// 下载图片为字节数组（对齐 Kira download_file）：
+    /// 带 qzone Referer 重试，最后一次不带 Referer 兼容外部 CDN；
+    /// HTTP 400（rkey 过期/签名失效）快速失败不重试，交由上层 get_msg 续命或降级；
+    /// 其余失败每次重试前等 2s。全部失败返回 null。
+    /// </summary>
+    public static async Task<byte[]?> DownloadImageAsync(string url, int maxRetries = 3, CancellationToken ct = default)
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-        http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-        http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://user.qzone.qq.com/");
-        var bytes = await http.GetByteArrayAsync(url, ct);
-        return bytes;
+        url = CleanUrl(url);
+        if (!url.StartsWith("http", StringComparison.OrdinalIgnoreCase)) return null;
+
+        for (int attempt = 0; attempt < maxRetries; attempt++)
+        {
+            try
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+                http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                // 前几次带 qzone Referer，最后一次不带（兼容外部 CDN）
+                if (attempt < maxRetries - 1)
+                    http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://qzone.qq.com/");
+                using var resp = await http.GetAsync(url, ct);
+                if ((int)resp.StatusCode == 200)
+                    return await resp.Content.ReadAsByteArrayAsync(ct);
+                // rkey 过期 / 签名失效：重试同一 URL 无意义，快速失败
+                if ((int)resp.StatusCode == 400)
+                    return null;
+            }
+            catch (Exception)
+            {
+                // 超时/网络异常：进入下一轮重试
+            }
+            if (attempt < maxRetries - 1)
+                await Task.Delay(TimeSpan.FromSeconds(2), ct);
+        }
+        return null;
+    }
+
+    /// <summary>清洗URL：去多余空格/引号，解码HTML实体，移除空白字符</summary>
+    public static string CleanUrl(string url)
+    {
+        url = (url ?? "").Trim().Trim('"').Trim('\'');
+        url = System.Net.WebUtility.HtmlDecode(url);
+        url = Regex.Replace(url, @"\s+", "");
+        return url;
     }
 
     /// <summary>规范化图片列表，返回字节数组列表（校验图片魔数）</summary>
@@ -467,7 +506,12 @@ public static class QzoneParser
             {
                 if (img.StartsWith("http://") || img.StartsWith("https://"))
                 {
-                    var data = await DownloadImageAsync(img, ct);
+                    var data = await DownloadImageAsync(img, ct: ct);
+                    if (data == null)
+                    {
+                        errors.Add($"图片下载失败（可能链接已过期）: {img[..Math.Min(80, img.Length)]}");
+                        continue;
+                    }
                     if (!LooksLikeImage(data))
                     {
                         errors.Add($"下载内容不是图片（链接可能已过期返回错误页）: {img[..Math.Min(80, img.Length)]}");
@@ -504,6 +548,7 @@ public static class QzoneParser
         new byte[] { 0x47, 0x49, 0x46, 0x38 },     // GIF
         new byte[] { 0x52, 0x49, 0x46, 0x46 },     // WebP/RIFF
         new byte[] { 0x42, 0x4D },                 // BMP
+        new byte[] { 0x00, 0x00, 0x00 },           // HEIC/MP4 系（粗判）
     };
 
     /// <summary>校验下载内容是否为图片</summary>

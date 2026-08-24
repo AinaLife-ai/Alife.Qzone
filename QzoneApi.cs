@@ -1,13 +1,15 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace AinaLife.Qzone;
 
-/// <summary>QQ空间HTTP API封装（完整移植自 KiraAI_qzone_plugin）</summary>
+/// <summary>
+/// QQ空间HTTP API封装（完整移植自 KiraAI_qzone_plugin qzone/api.py）。
+/// 持有可变 Session 与传输层，Cookie 原地刷新后所有接口自动用上新凭证。
+/// </summary>
 public class QzoneApi
 {
     private const string BaseUrl = "https://user.qzone.qq.com";
@@ -30,17 +32,16 @@ public class QzoneApi
     private const string DetailMobileUrl = "https://mobile.qzone.qq.com/detail";
     private const string MobileUa = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
-    private readonly HttpClient _http;
-    private readonly QzoneContext _ctx;
+    private readonly QzoneHttpClient _client;
+    private readonly QzoneSession _session;
 
-    public QzoneApi(QzoneContext ctx, int timeout = 30)
+    public QzoneApi(QzoneSession session, QzoneHttpClient client)
     {
-        _ctx = ctx;
-        _http = new HttpClient(new HttpClientHandler { UseCookies = false })
-        {
-            Timeout = TimeSpan.FromSeconds(timeout)
-        };
+        _session = session;
+        _client = client;
     }
+
+    private QzoneContext Ctx => _session.GetCtx();
 
     private static bool IsZero(object? v)
     {
@@ -48,41 +49,7 @@ public class QzoneApi
         try { return Convert.ToInt64(v) == 0; } catch { return false; }
     }
 
-    private async Task<Dictionary<string, object?>> RequestAsync(
-        HttpMethod method,
-        string url,
-        Dictionary<string, string>? query = null,
-        Dictionary<string, string>? form = null,
-        Dictionary<string, string>? headers = null,
-        CancellationToken ct = default)
-    {
-        var fullUrl = url;
-        if (query != null && query.Count > 0)
-        {
-            var qs = string.Join("&", query.Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
-            fullUrl += (url.Contains('?') ? "&" : "?") + qs;
-        }
-
-        using var req = new HttpRequestMessage(method, fullUrl);
-        foreach (var (k, v) in _ctx.Headers())
-            req.Headers.TryAddWithoutValidation(k, v);
-        if (headers != null)
-        {
-            foreach (var (k, v) in headers)
-                req.Headers.TryAddWithoutValidation(k, v);
-        }
-        foreach (var (k, v) in _ctx.Cookies())
-            req.Headers.TryAddWithoutValidation("Cookie", $"{k}={v}");
-
-        if (form != null && form.Count > 0)
-            req.Content = new FormUrlEncodedContent(form);
-
-        using var resp = await _http.SendAsync(req, ct);
-        var text = await resp.Content.ReadAsStringAsync(ct);
-        return QzoneParser.ParseResponse(text);
-    }
-
-    /// <summary>上传单张图片</summary>
+    /// <summary>上传单张图片（本接口较为脆弱，给足 60s 超时）</summary>
     public async Task<ApiResponse> UploadImageAsync(byte[] image, CancellationToken ct = default)
     {
         var form = new Dictionary<string, string>
@@ -92,12 +59,12 @@ public class QzoneApi
             ["albumtype"] = "7",
             ["exttype"] = "0",
             ["refer"] = "shuoshuo",
-            ["skey"] = _ctx.Skey,
-            ["uin"] = _ctx.Uin.ToString(),
-            ["p_uin"] = _ctx.Uin.ToString(),
-            ["zzpaneluin"] = _ctx.Uin.ToString(),
+            ["skey"] = Ctx.Skey,
+            ["uin"] = Ctx.Uin.ToString(),
+            ["p_uin"] = Ctx.Uin.ToString(),
+            ["zzpaneluin"] = Ctx.Uin.ToString(),
             ["zzpanelkey"] = "",
-            ["p_skey"] = _ctx.PSkey,
+            ["p_skey"] = Ctx.PSkey,
             ["output_type"] = "json",
             ["charset"] = "utf-8",
             ["output_charset"] = "utf-8",
@@ -108,15 +75,16 @@ public class QzoneApi
             ["base64"] = "1",
             ["picfile"] = Convert.ToBase64String(image),
         };
-        var raw = await RequestAsync(HttpMethod.Post, UploadImageUrl,
-            query: new() { ["g_tk"] = _ctx.Gtk2 },
+        var raw = await _client.RequestAsync(HttpMethod.Post, UploadImageUrl,
+            query: new() { ["g_tk"] = Ctx.Gtk2 },
             form: form,
-            headers: new() { ["referer"] = $"{BaseUrl}/{_ctx.Uin}", ["origin"] = BaseUrl },
+            headers: new() { ["referer"] = $"{BaseUrl}/{Ctx.Uin}", ["origin"] = BaseUrl },
+            timeoutSeconds: 60,
             ct: ct);
         return ApiResponse.FromRaw(raw, codeKey: "ret", msgKeys: new[] { "msg" });
     }
 
-    /// <summary>发布说说</summary>
+    /// <summary>发布说说。allowImageDrop=true 时配图全部获取失败降级为纯文字发布而不是整个失败。</summary>
     public async Task<ApiResponse> PublishAsync(string text, List<string>? images = null, bool allowImageDrop = false, CancellationToken ct = default)
     {
         var data = new Dictionary<string, string>
@@ -129,10 +97,10 @@ public class QzoneApi
             ["ver"] = "1",
             ["ugc_right"] = "1",
             ["to_sign"] = "0",
-            ["hostuin"] = _ctx.Uin.ToString(),
+            ["hostuin"] = Ctx.Uin.ToString(),
             ["code_version"] = "1",
             ["format"] = "json",
-            ["qzreferrer"] = $"{BaseUrl}/{_ctx.Uin}",
+            ["qzreferrer"] = $"{BaseUrl}/{Ctx.Uin}",
         };
 
         var downloadErrors = new List<string>();
@@ -165,8 +133,8 @@ public class QzoneApi
             }
         }
 
-        var raw = await RequestAsync(HttpMethod.Post, EmotionUrl,
-            query: new() { ["g_tk"] = _ctx.Gtk2, ["uin"] = _ctx.Uin.ToString() },
+        var raw = await _client.RequestAsync(HttpMethod.Post, EmotionUrl,
+            query: new() { ["g_tk"] = Ctx.Gtk2, ["uin"] = Ctx.Uin.ToString() },
             form: data, ct: ct);
         var resp = ApiResponse.FromRaw(raw);
         if (resp.Ok && downloadErrors.Count > 0)
@@ -179,7 +147,7 @@ public class QzoneApi
     {
         var query = new Dictionary<string, string>
         {
-            ["g_tk"] = _ctx.Gtk2,
+            ["g_tk"] = Ctx.Gtk2,
             ["uin"] = targetUin.ToString(),
             ["ftype"] = "0",
             ["sort"] = "0",
@@ -192,19 +160,19 @@ public class QzoneApi
             ["need_comment"] = "1",
             ["need_private_comment"] = "1",
         };
-        var raw = await RequestAsync(HttpMethod.Get, ListUrl, query: query, ct: ct);
+        var raw = await _client.RequestAsync(HttpMethod.Get, ListUrl, query: query, ct: ct);
         return ApiResponse.FromRaw(raw);
     }
 
-    /// <summary>获取说说详情（h5 → pc → mobile 三路回退）</summary>
+    /// <summary>获取说说详情（h5 → pc → mobile 三路回退，pc/mobile 空响应只试 1 次快速兜底）</summary>
     public async Task<ApiResponse> GetDetailAsync(long uin, string tid, CancellationToken ct = default)
     {
         var errors = new List<string>();
         // 方法1: h5 msgdetail_v6（实测唯一稳定路径）
         try
         {
-            var raw = await RequestAsync(HttpMethod.Get, DetailUrl,
-                query: new() { ["uin"] = uin.ToString(), ["tid"] = tid, ["format"] = "jsonp", ["g_tk"] = _ctx.Gtk2 }, ct: ct);
+            var raw = await _client.RequestAsync(HttpMethod.Get, DetailUrl,
+                query: new() { ["uin"] = uin.ToString(), ["tid"] = tid, ["format"] = "jsonp", ["g_tk"] = Ctx.Gtk2 }, ct: ct);
             if (IsZero(raw.GetValueOrDefault("code")) || raw.ContainsKey("msglist") || raw.ContainsKey("data"))
                 return ApiResponse.FromRaw(raw);
             errors.Add($"h5: {raw.GetValueOrDefault("message") ?? raw.GetValueOrDefault("msg")}");
@@ -213,10 +181,11 @@ public class QzoneApi
         // 方法2: PC getdetailv6
         try
         {
-            var raw = await RequestAsync(HttpMethod.Post, DetailPcUrl,
-                query: new() { ["g_tk"] = _ctx.Gtk2 },
-                form: new() { ["uin"] = uin.ToString(), ["tid"] = tid, ["format"] = "json", ["hostuin"] = _ctx.Uin.ToString(), ["qzreferrer"] = $"{BaseUrl}/{_ctx.Uin}/main" },
+            var raw = await _client.RequestAsync(HttpMethod.Post, DetailPcUrl,
+                query: new() { ["g_tk"] = Ctx.Gtk2 },
+                form: new() { ["uin"] = uin.ToString(), ["tid"] = tid, ["format"] = "json", ["hostuin"] = Ctx.Uin.ToString(), ["qzreferrer"] = $"{BaseUrl}/{Ctx.Uin}/main" },
                 headers: new() { ["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8", ["Referer"] = $"{BaseUrl}/{uin}", ["Origin"] = BaseUrl },
+                emptyRetryLimit: 1,
                 ct: ct);
             if (IsZero(raw.GetValueOrDefault("code")) || IsZero(raw.GetValueOrDefault("ret")) || raw.ContainsKey("msglist") || raw.ContainsKey("data"))
                 return ApiResponse.FromRaw(raw);
@@ -226,9 +195,10 @@ public class QzoneApi
         // 方法3: mobile detail
         try
         {
-            var raw = await RequestAsync(HttpMethod.Get, DetailMobileUrl,
-                query: new() { ["g_tk"] = _ctx.Gtk2, ["uin"] = uin.ToString(), ["cellid"] = tid, ["format"] = "json" },
+            var raw = await _client.RequestAsync(HttpMethod.Get, DetailMobileUrl,
+                query: new() { ["g_tk"] = Ctx.Gtk2, ["uin"] = uin.ToString(), ["cellid"] = tid, ["format"] = "json" },
                 headers: new() { ["User-Agent"] = MobileUa, ["Referer"] = "https://mobile.qzone.qq.com", ["Accept"] = "application/json, text/plain, */*", ["X-Requested-With"] = "XMLHttpRequest" },
+                emptyRetryLimit: 1,
                 ct: ct);
             if (IsZero(raw.GetValueOrDefault("code")) || raw.ContainsKey("data"))
                 return ApiResponse.FromRaw(raw);
@@ -238,7 +208,11 @@ public class QzoneApi
         return new ApiResponse(false, -1, string.Join("; ", errors), new(), new());
     }
 
-    /// <summary>点赞（精易2024实测格式：unikey带.1后缀，from=-100）</summary>
+    /// <summary>
+    /// 点赞/取消点赞（精易2024实测格式：unikey带.1后缀，from=-100，face=0。
+    /// 旧格式 from=1 / unikey 无 .1 均假成功，不再使用）。
+    /// abstime 必须传说说发布时间。
+    /// </summary>
     public async Task<ApiResponse> LikeAsync(QzonePost post, long abstime, bool unlike = false, CancellationToken ct = default)
     {
         var url = unlike ? DolikeUnlikeUrl : DolikeUrl;
@@ -256,13 +230,16 @@ public class QzoneApi
             ["format"] = "json",
         };
         if (abstime > 0) form["abstime"] = abstime.ToString();
-        var raw = await RequestAsync(HttpMethod.Post, url, query: new() { ["g_tk"] = _ctx.Gtk2 }, form: form, ct: ct);
+        var raw = await _client.RequestAsync(HttpMethod.Post, url, query: new() { ["g_tk"] = Ctx.Gtk2 }, form: form, ct: ct);
         if (IsZero(raw.GetValueOrDefault("ret")) || IsZero(raw.GetValueOrDefault("code")))
             raw["code"] = 0L;
         return ApiResponse.FromRaw(raw);
     }
 
-    /// <summary>获取点赞列表（unikey带.1后缀，query_count格式）</summary>
+    /// <summary>
+    /// 获取点赞列表（点赞人 + 总数 + is_dolike）。
+    /// unikey 优先用说说的真实 like key（curlikekey/orglikekey），手拼 mood/{tid}.1 仅作回退。
+    /// </summary>
     public async Task<ApiResponse> GetLikeListAsync(QzonePost post, int queryCount = 20, CancellationToken ct = default)
     {
         var tid = QzoneParser.NormalizeTid(post.Tid);
@@ -272,35 +249,39 @@ public class QzoneApi
             : $"http://user.qzone.qq.com/{post.Uin}/mood/{tid}.1";
         var query = new Dictionary<string, string>
         {
-            ["uin"] = _ctx.Uin.ToString(),
+            ["uin"] = Ctx.Uin.ToString(),
             ["unikey"] = unikey,
             ["begin_uin"] = "0",
             ["query_count"] = queryCount.ToString(),
             ["if_first_page"] = "1",
-            ["g_tk"] = _ctx.Gtk2,
+            ["g_tk"] = Ctx.Gtk2,
             ["format"] = "json",
         };
-        var raw = await RequestAsync(HttpMethod.Get, LikeListUrl, query: query,
-            headers: new() { ["Referer"] = $"{BaseUrl}/{post.Uin}" }, ct: ct);
+        var raw = await _client.RequestAsync(HttpMethod.Get, LikeListUrl, query: query,
+            headers: new() { ["Referer"] = $"{BaseUrl}/{post.Uin}" },
+            emptyRetryLimit: 1,
+            ct: ct);
         return ApiResponse.FromRaw(raw);
     }
 
-    /// <summary>获取用户基本资料（昵称等）</summary>
+    /// <summary>获取用户基本资料（昵称等），用于展示自己昵称（防「我」昵称诈骗）</summary>
     public async Task<ApiResponse> GetUserInfoAsync(long uin, CancellationToken ct = default)
     {
-        var raw = await RequestAsync(HttpMethod.Get, PersonalCardUrl,
-            query: new() { ["uin"] = uin.ToString(), ["g_tk"] = _ctx.Gtk2 },
-            headers: new() { ["Referer"] = $"{BaseUrl}/{uin}" }, ct: ct);
+        var raw = await _client.RequestAsync(HttpMethod.Get, PersonalCardUrl,
+            query: new() { ["uin"] = uin.ToString(), ["g_tk"] = Ctx.Gtk2 },
+            headers: new() { ["Referer"] = $"{BaseUrl}/{uin}" },
+            emptyRetryLimit: 1,
+            ct: ct);
         return ApiResponse.FromRaw(raw);
     }
 
-    /// <summary>评论说说（user JSON路径优先，失败回退H5表单路径）</summary>
+    /// <summary>评论说说（user JSON路径优先，失败回退H5表单路径；ret=0 兼容防误判后 H5 双发）</summary>
     public async Task<ApiResponse> CommentAsync(long targetUin, string tid, string content, CancellationToken ct = default)
     {
         var qzreferrer = $"https://user.qzone.qq.com/{targetUin}/main";
         // user 路径
-        var rawUser = await RequestAsync(HttpMethod.Post, CommentUrl,
-            query: new() { ["g_tk"] = _ctx.Gtk2 },
+        var rawUser = await _client.RequestAsync(HttpMethod.Post, CommentUrl,
+            query: new() { ["g_tk"] = Ctx.Gtk2 },
             form: new() { ["hostUin"] = targetUin.ToString(), ["topicId"] = $"{targetUin}_{tid}", ["content"] = content, ["format"] = "json", ["qzreferrer"] = qzreferrer },
             ct: ct);
         var userResp = ApiResponse.FromRaw(rawUser);
@@ -311,12 +292,12 @@ public class QzoneApi
             return userResp;
         }
         // H5 回退
-        var rawH5 = await RequestAsync(HttpMethod.Post, CommentH5Url,
-            query: new() { ["g_tk"] = _ctx.Gtk2 },
+        var rawH5 = await _client.RequestAsync(HttpMethod.Post, CommentH5Url,
+            query: new() { ["g_tk"] = Ctx.Gtk2 },
             form: new()
             {
                 ["topicId"] = $"{targetUin}_{tid}__1",
-                ["uin"] = _ctx.Uin.ToString(),
+                ["uin"] = Ctx.Uin.ToString(),
                 ["hostUin"] = targetUin.ToString(),
                 ["feedsType"] = "100",
                 ["inCharset"] = "utf-8",
@@ -348,7 +329,7 @@ public class QzoneApi
             new(), new());
     }
 
-    /// <summary>回复评论（API锚定主评论，楼中回复写入QQ原生关系标记）</summary>
+    /// <summary>回复评论（API锚定主评论，楼中回复写入QQ原生关系标记 @{uin,nick,who:1,auto:1}）</summary>
     public async Task<ApiResponse> ReplyAsync(QzonePost post, QzoneComment comment, string content, QzoneComment? rootComment = null, CancellationToken ct = default)
     {
         var root = rootComment ?? comment;
@@ -359,12 +340,12 @@ public class QzoneApi
         if (comment.ParentTid != null)
             replyContent = $"@{{uin:{comment.Uin},nick:{comment.Nickname},who:1,auto:1}}{content}";
 
-        var raw = await RequestAsync(HttpMethod.Post, ReplyUrl,
-            query: new() { ["g_tk"] = _ctx.Gtk2 },
+        var raw = await _client.RequestAsync(HttpMethod.Post, ReplyUrl,
+            query: new() { ["g_tk"] = Ctx.Gtk2 },
             form: new()
             {
                 ["topicId"] = $"{post.Uin}_{post.Tid}__1",
-                ["uin"] = _ctx.Uin.ToString(),
+                ["uin"] = Ctx.Uin.ToString(),
                 ["hostUin"] = post.Uin.ToString(),
                 ["feedsType"] = "100",
                 ["inCharset"] = "utf-8",
@@ -381,7 +362,7 @@ public class QzoneApi
                 ["richtype"] = "",
                 ["private"] = "0",
                 ["paramstr"] = "2",
-                ["qzreferrer"] = $"{BaseUrl}/{_ctx.Uin}/main",
+                ["qzreferrer"] = $"{BaseUrl}/{Ctx.Uin}/main",
             },
             headers: new()
             {
@@ -400,12 +381,12 @@ public class QzoneApi
     /// <summary>删除说说</summary>
     public async Task<ApiResponse> DeleteAsync(string tid, CancellationToken ct = default)
     {
-        var raw = await RequestAsync(HttpMethod.Post, DeleteUrl,
-            query: new() { ["g_tk"] = _ctx.Gtk2 },
+        var raw = await _client.RequestAsync(HttpMethod.Post, DeleteUrl,
+            query: new() { ["g_tk"] = Ctx.Gtk2 },
             form: new()
             {
-                ["uin"] = _ctx.Uin.ToString(),
-                ["topicId"] = $"{_ctx.Uin}_{tid}__1",
+                ["uin"] = Ctx.Uin.ToString(),
+                ["topicId"] = $"{Ctx.Uin}_{tid}__1",
                 ["feedsType"] = "0",
                 ["feedsFlag"] = "0",
                 ["feedsKey"] = tid,
@@ -413,38 +394,41 @@ public class QzoneApi
                 ["feedsTime"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
                 ["fupdate"] = "1",
                 ["ref"] = "feeds",
-                ["qzreferrer"] = $"{BaseUrl}/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds_html_module?g_iframeUser=1&i_uin={_ctx.Uin}&i_login_uin={_ctx.Uin}&mode=4&previewV8=1&style=35&version=8&needDelOpr=true",
+                ["qzreferrer"] = $"{BaseUrl}/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds_html_module?g_iframeUser=1&i_uin={Ctx.Uin}&i_login_uin={Ctx.Uin}&mode=4&previewV8=1&style=35&version=8&needDelOpr=true",
             },
             ct: ct);
         return ApiResponse.FromRaw(raw);
     }
 
-    /// <summary>删除评论（h5 delcomment_ugc，双参数变体）</summary>
+    /// <summary>
+    /// 删除评论（唯一路径：h5 代理域 emotion_cgi_delcomment_ugc，双参数变体）。
+    /// 成功判定兼容顶层与嵌套 data 里的 ret/code（注意不能用 or -1：code=0 是 falsy 会被吞）。
+    /// </summary>
     public async Task<ApiResponse> DeleteCommentAsync(string uin, string tid, string commentId, string commentUin = "", CancellationToken ct = default)
     {
         var topicId = $"{uin}_{tid}";
-        var qzreferrer = $"{BaseUrl}/{_ctx.Uin}/main";
+        var qzreferrer = $"{BaseUrl}/{Ctx.Uin}/main";
         var errors = new List<string>();
 
         var variants = new[]
         {
             new Dictionary<string, string>
             {
-                ["uin"] = _ctx.Uin.ToString(),
+                ["uin"] = Ctx.Uin.ToString(),
                 ["hostUin"] = uin,
                 ["topicId"] = topicId,
                 ["commentId"] = commentId,
                 ["inCharset"] = "utf-8",
                 ["outCharset"] = "utf-8",
                 ["ref"] = "",
-                ["hostuin"] = _ctx.Uin.ToString(),
+                ["hostuin"] = Ctx.Uin.ToString(),
                 ["code_version"] = "1",
                 ["format"] = "fs",
-                ["qzreferrer"] = $"{BaseUrl}/{_ctx.Uin}",
+                ["qzreferrer"] = $"{BaseUrl}/{Ctx.Uin}",
             },
             new Dictionary<string, string>
             {
-                ["hostuin"] = _ctx.Uin.ToString(),
+                ["hostuin"] = Ctx.Uin.ToString(),
                 ["uin"] = uin,
                 ["tid"] = tid,
                 ["comment_id"] = commentId,
@@ -457,10 +441,11 @@ public class QzoneApi
         {
             try
             {
-                var raw = await RequestAsync(HttpMethod.Post, DeleteCommentH5Url,
-                    query: new() { ["g_tk"] = _ctx.Gtk2 },
+                var raw = await _client.RequestAsync(HttpMethod.Post, DeleteCommentH5Url,
+                    query: new() { ["g_tk"] = Ctx.Gtk2 },
                     form: variants[idx],
                     headers: new() { ["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8", ["Referer"] = "https://h5.qzone.qq.com/", ["Origin"] = "https://h5.qzone.qq.com", ["Accept"] = "*/*" },
+                    emptyRetryLimit: 1,
                     ct: ct);
                 if (IsZero(raw.GetValueOrDefault("ret")) || IsZero(raw.GetValueOrDefault("code")) ||
                     (raw.GetValueOrDefault("data") is Dictionary<string, object?> dd && (IsZero(dd.GetValueOrDefault("ret")) || IsZero(dd.GetValueOrDefault("code")))))
@@ -475,21 +460,22 @@ public class QzoneApi
         return new ApiResponse(false, -1, string.Join(" | ", errors), new(), new());
     }
 
-    /// <summary>获取最近访客和统计</summary>
+    /// <summary>获取最近访客和统计（轻量接口，兼作会话保活探针）</summary>
     public async Task<ApiResponse> GetVisitorAsync(int limit = 20, CancellationToken ct = default)
     {
-        var raw = await RequestAsync(HttpMethod.Get, VisitorUrl,
+        var raw = await _client.RequestAsync(HttpMethod.Get, VisitorUrl,
             query: new()
             {
-                ["uin"] = _ctx.Uin.ToString(),
+                ["uin"] = Ctx.Uin.ToString(),
                 ["mask"] = "7",
-                ["g_tk"] = _ctx.Gtk2,
+                ["g_tk"] = Ctx.Gtk2,
                 ["format"] = "json",
                 ["page"] = "1",
                 ["fupdate"] = "1",
                 ["clear"] = "0",
             },
-            headers: new() { ["Referer"] = $"{BaseUrl}/{_ctx.Uin}", ["Accept"] = "application/json, text/javascript, */*; q=0.01", ["X-Requested-With"] = "XMLHttpRequest" },
+            headers: new() { ["Referer"] = $"{BaseUrl}/{Ctx.Uin}", ["Accept"] = "application/json, text/javascript, */*; q=0.01", ["X-Requested-With"] = "XMLHttpRequest" },
+            emptyRetryLimit: 1,
             ct: ct);
         return ApiResponse.FromRaw(raw);
     }
@@ -497,10 +483,10 @@ public class QzoneApi
     /// <summary>获取好友最近说说（feeds3_html_more，HTML解析）</summary>
     public async Task<ApiResponse> GetRecentFeedsAsync(int page = 1, CancellationToken ct = default)
     {
-        var raw = await RequestAsync(HttpMethod.Get, ZoneListUrl,
+        var raw = await _client.RequestAsync(HttpMethod.Get, ZoneListUrl,
             query: new()
             {
-                ["uin"] = _ctx.Uin.ToString(),
+                ["uin"] = Ctx.Uin.ToString(),
                 ["scope"] = "0",
                 ["view"] = "1",
                 ["filter"] = "all",
@@ -512,7 +498,7 @@ public class QzoneApi
                 ["aisortBeginTime"] = "0",
                 ["begintime"] = "0",
                 ["format"] = "json",
-                ["g_tk"] = _ctx.Gtk2,
+                ["g_tk"] = Ctx.Gtk2,
                 ["useutf8"] = "1",
                 ["outputhtmlfeed"] = "1",
             },

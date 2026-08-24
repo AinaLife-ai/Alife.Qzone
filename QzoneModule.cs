@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -16,23 +15,34 @@ using Alife.Function.FunctionCaller;
 using Alife.Function.QChat;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel.Agents;
-using Microsoft.SemanticKernel.ChatCompletion;
 
 namespace AinaLife.Qzone;
 
 public class QzoneConfig
 {
     [DisplayName("Cookie字符串")]
-    [Description("QQ空间登录Cookie，格式如 uin=o123; skey=xxx; p_skey=yyy")]
+    [Description("QQ空间登录Cookie（仅作自动刷新失败时的应急后备），格式如 uin=o123; skey=xxx; p_skey=yyy")]
     public string CookiesStr { get; set; } = "";
 
+    [DisplayName("自动刷新Cookie")]
+    [Description("从OneBot自动获取最新Cookie（推荐开启，四层机制：启动/用即刷/周期/失效自救）")]
+    public bool AutoRefreshCookie { get; set; } = true;
+
+    [DisplayName("Cookie刷新间隔")]
+    [Description("Cookie周期刷新间隔（±10%抖动），如 2h/30m/7200；0=仅启动时+失效时刷新")]
+    public string CookieRefreshInterval { get; set; } = "2h";
+
+    [DisplayName("用即刷节流")]
+    [Description("调用空间功能时距上次刷新超过该间隔则顺手刷新，如 10m；0=关闭")]
+    public string CookieRefreshOnUse { get; set; } = "10m";
+
     [DisplayName("主人QQ号")]
-    [Description("允许执行敏感操作的主人QQ号，多个用逗号分隔")]
+    [Description("允许执行敏感操作的主人QQ号，多个用逗号分隔（仅当启用主人检查时生效）")]
     public string MasterIds { get; set; } = "";
 
     [DisplayName("启用主人检查")]
-    [Description("敏感操作是否仅限主人")]
-    public bool MasterCheckEnabled { get; set; } = true;
+    [Description("敏感操作是否仅限主人。官方不建议开启（会拦截AI自主行为），推荐在人设/提示词层控制权限")]
+    public bool MasterCheckEnabled { get; set; } = false;
 
     [DisplayName("访客显示上限")]
     [Description("访客列表最多显示条数")]
@@ -42,8 +52,12 @@ public class QzoneConfig
     [Description("说说点赞用户最多显示人数")]
     public int LikeUsersDisplayMax { get; set; } = 5;
 
+    [DisplayName("查看评论显示上限")]
+    [Description("查看说说时每条最多显示的评论数（省token）")]
+    public int ViewCommentMax { get; set; } = 10;
+
     [DisplayName("评论后自动点赞")]
-    [Description("评论后是否自动点赞")]
+    [Description("评论后是否自动点赞（幂等命中已存在相同评论时不赞）")]
     public bool LikeWhenComment { get; set; } = true;
 
     [DisplayName("自动点赞延迟(秒)")]
@@ -55,63 +69,51 @@ public class QzoneConfig
     public double LikeDelayJitter { get; set; } = 1.0;
 
     [DisplayName("写操作节流间隔(秒)")]
-    [Description("点赞/评论等写操作的最小间隔")]
+    [Description("点赞/评论等写操作的最小间隔（透明节流，不拦截不失败）")]
     public double WriteThrottleSeconds { get; set; } = 1.0;
 
     [DisplayName("请求超时(秒)")]
-    [Description("HTTP请求超时时间")]
+    [Description("HTTP请求超时时间（OneBot获取Cookie固定5秒快速失败，不受其影响）")]
     public int Timeout { get; set; } = 30;
 
-    [DisplayName("自动刷新Cookie")]
-    [Description("从OneBot自动获取最新Cookie")]
-    public bool AutoRefreshCookie { get; set; } = true;
-
-    [DisplayName("Cookie刷新间隔")]
-    [Description("Cookie周期刷新间隔，如 2h/30m/7200")]
-    public string CookieRefreshInterval { get; set; } = "2h";
-
-    [DisplayName("用即刷节流")]
-    [Description("调用空间功能时距上次刷新超过该间隔则顺手刷新，如 10m")]
-    public string CookieRefreshOnUse { get; set; } = "10m";
-
     [DisplayName("自动发布定时")]
-    [Description("自动发布说说定时表达式，cron或interval格式，如 */30 * * * * 或 30m")]
+    [Description("自动发布说说定时表达式，cron或interval格式，如 */30 * * * * 或 30m、2h/30m(抖动)；空=禁用")]
     public string AutoPublishSchedule { get; set; } = "";
 
     [DisplayName("自动评论定时")]
-    [Description("自动评论定时表达式")]
+    [Description("自动评论定时表达式，格式同上")]
     public string AutoCommentSchedule { get; set; } = "";
 
     [DisplayName("自动回复定时")]
-    [Description("自动回复定时表达式")]
+    [Description("自动回复定时表达式，格式同上")]
     public string AutoReplySchedule { get; set; } = "";
 
     [DisplayName("启用自动回复")]
-    [Description("是否启用自动回复评论")]
+    [Description("是否启用自动回复评论（需配合自动回复定时）")]
     public bool AutoReplyEnabled { get; set; } = false;
 
     [DisplayName("每轮最大评论数")]
-    [Description("每轮自动评论最多条数")]
+    [Description("每轮自动评论最多条数（后台模式）")]
     public int MaxCommentsPerCycle { get; set; } = 3;
 
     [DisplayName("每轮最大回复数")]
-    [Description("每轮自动回复最多条数")]
+    [Description("每轮自动回复最多条数（后台模式）")]
     public int MaxRepliesPerCycle { get; set; } = 5;
 
     [DisplayName("黑名单QQ")]
-    [Description("禁止操作的QQ号，逗号分隔")]
+    [Description("禁止操作的QQ号，逗号分隔（含查看；优先于白名单；填自己也禁自己）")]
     public string QzoneBlacklist { get; set; } = "";
 
     [DisplayName("白名单QQ")]
-    [Description("仅允许操作的QQ号，逗号分隔，空=不限制")]
+    [Description("仅允许操作的QQ号，逗号分隔；非空时仅名单内+自己；空=除黑名单全允许")]
     public string QzoneWhitelist { get; set; } = "";
 
     [DisplayName("黑名单时间段")]
-    [Description("定时任务黑名单时间段，如 00:00-06:00，多个用逗号分隔")]
+    [Description("定时任务黑名单时间段，如 00:00-06:00，支持跨天，多个用逗号分隔（只管定时任务）")]
     public string BlackoutSchedules { get; set; } = "";
 
     [DisplayName("图片清单启用")]
-    [Description("是否启用近期图片清单注入")]
+    [Description("是否启用近期图片清单（QQ消息到来时自动注入给AI）")]
     public bool ImageManifestEnabled { get; set; } = true;
 
     [DisplayName("图片清单数量")]
@@ -126,28 +128,44 @@ public class QzoneConfig
     [Description("是否允许对自己空间的说说识图")]
     public bool QzoneImageDescOwn { get; set; } = false;
 
+    [DisplayName("自动评论前识图")]
+    [Description("后台自动评论前先识别对方配图（更贴切但更费token）")]
+    public bool AutoCommentImageDesc { get; set; } = false;
+
     [DisplayName("自动发布群ID")]
-    [Description("自动发布说说的消息来源群号")]
+    [Description("后台直接生成模式数据源群号（未配置任务目标时生效）")]
     public string AutoPublishGroupId { get; set; } = "";
 
     [DisplayName("自动发布用户ID")]
-    [Description("自动发布说说的消息来源QQ号")]
+    [Description("后台直接生成模式数据源QQ号（群号也未配时生效）")]
     public string AutoPublishUserId { get; set; } = "";
 
     [DisplayName("自动发布配图概率")]
-    [Description("自动发布时配图的概率(0-1)")]
+    [Description("自动发布时进入配图候选流程的概率(0-1)")]
     public double AutoPublishImageProb { get; set; } = 1.0;
 
     [DisplayName("自动发布配图最少")]
-    [Description("自动发布配图最少张数")]
+    [Description("自动发布配图目标下限；抽到0时AI自主决定0~最多张")]
     public int AutoPublishImageMin { get; set; } = 0;
 
     [DisplayName("自动发布配图最多")]
-    [Description("自动发布配图最多张数")]
+    [Description("自动发布配图目标上限")]
     public int AutoPublishImageMax { get; set; } = 3;
 
+    [DisplayName("配图选图兜底")]
+    [Description("AI非法选图时是否兜底补足；关=降级发纯文字")]
+    public bool AutoPublishImageFallback { get; set; } = false;
+
+    [DisplayName("配图去重间隔")]
+    [Description("已发布图片的去重窗口，如 3d/72h/12h；0=不去重；仅发布成功后记录")]
+    public string AutoPublishImageDedupeInterval { get; set; } = "3d";
+
+    [DisplayName("评论提交校验")]
+    [Description("评论提交后回读确认（诊断模式，仅记录日志不阻断）")]
+    public bool CommentVerify { get; set; } = false;
+
     [DisplayName("任务群ID")]
-    [Description("定时任务指令发送的群号，逗号分隔")]
+    [Description("定时任务指令发送的群号，逗号分隔，随机选一个作为场合上下文")]
     public string TaskGroupIds { get; set; } = "";
 
     [DisplayName("任务私聊ID")]
@@ -155,16 +173,16 @@ public class QzoneConfig
     public string TaskPrivateIds { get; set; } = "";
 
     [DisplayName("任务消息风格")]
-    [Description("定时任务消息风格：silent=抑制群回复")]
+    [Description("定时任务消息风格：silent=提示AI不要向群/私聊发送回复（无痕）；notify=不做限制")]
     public string TaskMessageStyle { get; set; } = "silent";
 
     [DisplayName("吸附模式")]
-    [Description("发说说未指定图片时自动抓最近一张图")]
+    [Description("发说说未指定图片时自动抓最近一张图（开启则关闭清单机制，失败降级纯文字）")]
     public bool AutoAttachRecentImage { get; set; } = false;
 }
 
 [Module("QQ空间",
-    "提供QQ空间说说发布、查看、点赞、评论、删除、访客统计、定时任务、Cookie自动刷新等功能",
+    "提供QQ空间说说发布、查看、点赞、评论、回复、删除、访客统计、图片识图、定时任务、Cookie自动获取与刷新等功能",
     defaultCategory: "AinaLife/社交平台")]
 public class QzoneModule(
     XmlFunctionCaller functionCaller,
@@ -177,7 +195,7 @@ public class QzoneModule(
 {
     public QzoneConfig Configuration { get; set; } = null!;
 
-    // QChatService 未公开 OneBotClient，通过反射获取（不修改官方代码）
+    // QChatService 未公开 OneBotClient（官方源码字段名 oneBotClient），通过反射获取（不修改官方代码）
     private OneBotClient? GetClient()
     {
         var field = typeof(QChatService).GetField("oneBotClient",
@@ -185,8 +203,10 @@ public class QzoneModule(
         return field?.GetValue(qChatService) as OneBotClient;
     }
 
+    private QzoneSession _session = null!;
+    private QzoneHttpClient _httpClient = null!;
     private QzoneApi? _api;
-    private QzoneContext? _ctx;
+    private QzoneState _state = null!;
     private long _myUin;
     private DateTime _lastWriteTime = DateTime.MinValue;
     private readonly HashSet<string> _masterIds = new();
@@ -198,24 +218,22 @@ public class QzoneModule(
     private readonly SemaphoreSlim _cookieRefreshLock = new(1, 1);
     private DateTime _lastCookieRefresh = DateTime.MinValue;
     private Timer? _cookieRefreshTimer;
-    private Timer? _autoPublishTimer;
-    private Timer? _autoCommentTimer;
-    private Timer? _autoReplyTimer;
     private bool _initFailed;
-    private bool _jobsAdded;
+    private bool _cookieHealing;      // 启动自愈窗口
+    private int _healAttempts;
 
-    // 状态持久化
-    private readonly HashSet<string> _repliedComments = new();
-    private readonly List<string> _myPostsHistory = new();
-    private readonly List<Dictionary<string, object>> _publishedImageHistory = new();
-    private string _statePath = "";
+    // 定时任务
+    private readonly List<ScheduledJob> _jobs = new();
+    private Timer? _scheduleTimer;
+    private readonly SemaphoreSlim _jobLock = new(1, 1);
 
     // 图片注册表 sid -> entries
     private readonly Dictionary<string, List<ImageEntry>> _imageRegistry = new();
     private readonly Dictionary<string, string> _urlMd5 = new();
-    private const int ImageRegistryCap = 20;
-    private const int MaxRepliedCache = 1000;
-    private const int MaxHistory = 10;
+
+    // 实时消息上下文（结构化发送者识别，来自 OneBot 事件）
+    private readonly Dictionary<string, (long UserId, DateTime Time)> _lastSenderBySource = new();
+    private bool _eventSubscribed;
 
     private class ImageEntry
     {
@@ -225,13 +243,27 @@ public class QzoneModule(
         public long Time { get; set; }
         public string? Desc { get; set; }
         public string? MsgId { get; set; }
+        public bool DescPending { get; set; }
     }
 
+    private class ScheduledJob
+    {
+        public required string Name { get; set; }
+        public required Func<Task> Run { get; set; }
+        public required Func<DateTime, DateTime> NextAfter { get; set; }
+        public DateTime NextRun;
+        public DateTime LastRun = DateTime.MinValue;
+        public DateTime LastExecuted = DateTime.MinValue;
+    }
+
+    // ==================== 权限与名单 ====================
+
+    // 人设层控权设计：默认不做代码层主人检查；开启后严格 fail-closed
     private bool IsMaster(string? userId)
     {
         if (!Configuration.MasterCheckEnabled) return true;
-        if (string.IsNullOrEmpty(userId)) return true;
-        if (userId.StartsWith("system")) return true;
+        if (string.IsNullOrEmpty(userId)) return false; // 无法识别发送者 = 拒绝（fail-closed）
+        if (userId.StartsWith("system")) return true;   // 系统/定时任务内部调用放行
         return _masterIds.Contains(userId);
     }
 
@@ -266,6 +298,8 @@ public class QzoneModule(
         return false;
     }
 
+    // ==================== 表达式解析 ====================
+
     private static int ParseIntervalSeconds(string? s, string defaultUnit = "m")
     {
         if (string.IsNullOrWhiteSpace(s)) return 0;
@@ -284,36 +318,29 @@ public class QzoneModule(
         };
     }
 
-    private static (double Min, double Jitter) ParseDelayRange(string? s, string def = "0.5-1.5s")
-    {
-        foreach (var cand in new[] { s, def })
-        {
-            if (string.IsNullOrWhiteSpace(cand)) continue;
-            var text = cand.Trim().ToLower();
-            if (text.EndsWith("s")) text = text[..^1];
-            if (text.Contains('-'))
-            {
-                var parts = text.Split('-', 2);
-                if (double.TryParse(parts[0], out var lo) && double.TryParse(parts[1], out var hi) && lo >= 0 && hi >= lo)
-                    return (lo, hi - lo);
-            }
-        }
-        return (0.5, 1.0);
-    }
-
-    private static (string Mode, string Expr, int IntervalSeconds, int JitterSeconds)? ParseSchedule(string? s)
+    /// <summary>解析定时表达式：cron（5段）或 interval（30m、2h/30m 抖动）。</summary>
+    private static Func<DateTime, DateTime>? BuildSchedule(string? s)
     {
         if (string.IsNullOrWhiteSpace(s)) return null;
         s = s.Trim();
-        if (s.Contains(' ') || s.Contains('*') || s.Contains('/'))
+
+        // cron：5 段
+        var parts = s.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 5)
         {
+            var fields = new HashSet<int>?[5];
             try
             {
-                var parts = s.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length >= 5) return ("cron", s, 0, 0);
+                int[][] ranges = { new[] { 0, 59 }, new[] { 0, 23 }, new[] { 1, 31 }, new[] { 1, 12 }, new[] { 0, 7 } };
+                for (int i = 0; i < 5; i++)
+                    fields[i] = ParseCronField(parts[i], ranges[i][0], ranges[i][1]);
             }
-            catch { }
+            catch { return null; }
+            if (fields.Any(f => f == null)) return null;
+            return after => NextCronTime(fields!, after);
         }
+
+        // interval：数字[hm](/数字[hm])，无单位默认分钟
         var m = Regex.Match(s, @"^(?<interval>\d+(?:\.\d+)?[hm]?)(?:/(?<jitter>\d+(?:\.\d+)?[hm]?))?$");
         if (m.Success)
         {
@@ -325,29 +352,83 @@ public class QzoneModule(
             }
             var interval = ParseTime(m.Groups["interval"].Value);
             var jitter = m.Groups["jitter"].Success ? ParseTime(m.Groups["jitter"].Value) : 0;
-            if (interval > 0) return ("interval", "", interval, jitter);
+            if (interval <= 0) return null;
+            return after =>
+            {
+                var delay = interval + (jitter > 0 ? Random.Shared.Next(0, jitter + 1) : 0);
+                return after.AddSeconds(delay);
+            };
         }
         return null;
     }
 
-    private static string FormatTime(long ts)
+    private static HashSet<int> ParseCronField(string field, int min, int max)
     {
-        try
+        var set = new HashSet<int>();
+        foreach (var part in field.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            var dt = DateTimeOffset.FromUnixTimeSeconds(ts).LocalDateTime;
-            return dt.ToString("yyyy-MM-dd HH:mm");
+            int step = 1;
+            var body = part;
+            var slash = part.IndexOf('/');
+            if (slash >= 0)
+            {
+                step = int.Parse(part[(slash + 1)..]);
+                body = part[..slash];
+                if (step <= 0) step = 1;
+            }
+            int lo, hi;
+            if (body == "*")
+            {
+                lo = min; hi = max;
+            }
+            else if (body.Contains('-'))
+            {
+                var p = body.Split('-', 2);
+                lo = int.Parse(p[0]); hi = int.Parse(p[1]);
+            }
+            else
+            {
+                lo = hi = int.Parse(body);
+                if (slash < 0) { set.Add(Norm(lo)); continue; }
+                // 形如 n/m：从 n 到 max 按步长
+                hi = max;
+            }
+            for (int v = lo; v <= hi; v += step)
+                set.Add(Norm(v));
         }
-        catch { return "未知时间"; }
+        int Norm(int v)
+        {
+            // 周日 7 → 0
+            if (max == 7 && v == 7) return 0;
+            if (v < min || v > max) throw new FormatException($"cron 字段越界: {v}");
+            return v;
+        }
+        return set;
     }
 
-    private static string NormalizeTid(string tid)
+    /// <summary>计算下一个 cron 触发时间（分钟粒度，最多向前找 366 天）</summary>
+    private static DateTime NextCronTime(HashSet<int>?[] fields, DateTime after)
     {
-        var s = tid?.Trim() ?? "";
-        if (s.Contains("/mood/")) s = s.Split("/mood/", 2)[1];
-        var idx = s.LastIndexOf('.');
-        if (idx > 0 && s[(idx + 1)..].All(char.IsDigit)) s = s[..idx];
-        return s;
+        var t = new DateTime(after.Year, after.Month, after.Day, after.Hour, after.Minute, 0).AddMinutes(1);
+        var limit = after.AddDays(366);
+        while (t <= limit)
+        {
+            if (fields[3]!.Contains(t.Month) &&
+                fields[4]!.Contains((int)t.DayOfWeek) &&
+                fields[2]!.Contains(t.Day) &&
+                fields[1]!.Contains(t.Hour) &&
+                fields[0]!.Contains(t.Minute))
+                return t;
+            t = t.AddMinutes(1);
+        }
+        return after.AddDays(1);
     }
+
+    // ==================== 文本工具 ====================
+
+    private static string FormatTime(long ts) => QzoneParser.FormatTime(ts);
+
+    private static string NormalizeTid(string tid) => QzoneParser.NormalizeTid(tid);
 
     private static (string Target, string Content) ParseCommentContent(string content)
     {
@@ -380,80 +461,12 @@ public class QzoneModule(
         return comments.FirstOrDefault(c => c.Tid == target.ParentTid) ?? target;
     }
 
-    // ==================== 状态持久化 ====================
+    // ==================== Cookie 管理（四层机制，对齐 Kira v1.40+） ====================
 
-    private string StatePath
-    {
-        get
-        {
-            if (string.IsNullOrEmpty(_statePath))
-            {
-                var dir = Path.Combine(AppContext.BaseDirectory, "Storage", "PluginData", "Qzone");
-                Directory.CreateDirectory(dir);
-                _statePath = Path.Combine(dir, "state.json");
-            }
-            return _statePath;
-        }
-    }
-
-    private void LoadState()
-    {
-        try
-        {
-            if (!File.Exists(StatePath)) return;
-            var json = File.ReadAllText(StatePath, Encoding.UTF8);
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("replied_comments", out var replied))
-            {
-                foreach (var item in replied.EnumerateArray())
-                    _repliedComments.Add(item.GetString() ?? "");
-            }
-            if (root.TryGetProperty("my_posts_history", out var history))
-            {
-                foreach (var item in history.EnumerateArray())
-                    _myPostsHistory.Add(item.GetString() ?? "");
-            }
-            if (root.TryGetProperty("published_image_history", out var pubHistory))
-            {
-                foreach (var item in pubHistory.EnumerateArray())
-                {
-                    var dict = new Dictionary<string, object>();
-                    if (item.TryGetProperty("identity", out var id)) dict["identity"] = id.GetString() ?? "";
-                    if (item.TryGetProperty("time", out var t)) dict["time"] = t.GetInt64();
-                    _publishedImageHistory.Add(dict);
-                }
-            }
-            logger.LogInformation("已加载持久化状态：历史说说 {HistoryCount} 条，已回复评论 {RepliedCount} 条",
-                _myPostsHistory.Count, _repliedComments.Count);
-        }
-        catch (Exception e)
-        {
-            logger.LogWarning(e, "加载插件状态失败");
-        }
-    }
-
-    private void SaveState()
-    {
-        try
-        {
-            var data = new Dictionary<string, object>
-            {
-                ["replied_comments"] = _repliedComments.TakeLast(MaxRepliedCache).ToList(),
-                ["my_posts_history"] = _myPostsHistory.TakeLast(MaxHistory).ToList(),
-                ["published_image_history"] = _publishedImageHistory.TakeLast(ImageRegistryCap).ToList()
-            };
-            var json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(StatePath, json, Encoding.UTF8);
-        }
-        catch (Exception e)
-        {
-            logger.LogWarning(e, "保存插件状态失败");
-        }
-    }
-
-    // ==================== Cookie管理 ====================
-
+    /// <summary>
+    /// 从 OneBot 获取最新 Cookie 并原地更新会话。
+    /// 节流：常规冷却 10s，force 最小 3s；失败也推进时间戳；失败保留现有会话（last-good）。
+    /// </summary>
     private async Task<bool> RefreshCookieAsync(bool force = false)
     {
         if (!Configuration.AutoRefreshCookie) return false;
@@ -468,11 +481,20 @@ public class QzoneModule(
                 return false;
             }
 
+            // 登录预检：OneBot 未连接时快速失败，避免每次白等
+            var client = GetClient();
+            if (client == null || !client.IsConnected)
+            {
+                _lastCookieRefresh = now;
+                logger.LogDebug("OneBot 未连接，跳过 Cookie 刷新");
+                return false;
+            }
+
             string? newCookie = null;
             try
             {
-                var client = GetClient();
-                if (client == null) return false;
+                // 固定 5s 快速超时（对齐 Kira：快速失败，不受插件 Timeout 影响）
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 var data = await client.CallActionAsync<JsonElement>("get_cookies", new { domain = "user.qzone.qq.com" });
                 if (data.TryGetProperty("data", out var d) && d.TryGetProperty("cookies", out var c))
                     newCookie = c.GetString();
@@ -492,12 +514,13 @@ public class QzoneModule(
 
             try
             {
-                Configuration.CookiesStr = newCookie;
-                _ctx = QzoneSession.BuildContext(newCookie);
-                _myUin = _ctx.Uin;
+                // 原地更新会话（不写回配置；配置的 Cookie 仅作应急后备）
+                _session.UpdateCookies(newCookie);
+                _myUin = _session.GetCtx().Uin;
                 _lastCookieRefresh = now;
                 _initFailed = false;
-                logger.LogInformation("已从 OneBot 获取最新 Cookie 并原地更新会话");
+                _cookieHealing = false;
+                logger.LogInformation("已从 OneBot 获取最新 Cookie 并原地更新会话 (uin={Uin})", _myUin);
                 return true;
             }
             catch (Exception e)
@@ -513,10 +536,59 @@ public class QzoneModule(
         }
     }
 
+    /// <summary>会话保活探针：用轻量访客接口验证旧会话是否仍然可用</summary>
+    private async Task<bool> CheckSessionAliveAsync()
+    {
+        try
+        {
+            if (_api == null || !_session.HasContext) return false;
+            var resp = await _api.GetVisitorAsync(1);
+            return resp.Ok;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>启动自愈：初始 Cookie 获取失败不判死，后台按 15/30/60/120s 递增重试最多 4 次</summary>
+    private void StartCookieSelfHeal()
+    {
+        if (!Configuration.AutoRefreshCookie) return;
+        _cookieHealing = true;
+        _healAttempts = 0;
+        int[] delays = { 15, 30, 60, 120 };
+        _ = Task.Run(async () =>
+        {
+            while (_healAttempts < delays.Length && _cookieHealing)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(delays[_healAttempts]));
+                if (!_cookieHealing) return;
+                _healAttempts++;
+                try
+                {
+                    if (await RefreshCookieAsync(force: true))
+                    {
+                        logger.LogInformation("Cookie 后台自愈成功（第 {N} 次尝试）", _healAttempts);
+                        return;
+                    }
+                }
+                catch (Exception e)
+                {
+                    logger.LogDebug(e, "Cookie 自愈尝试失败（第 {N} 次）", _healAttempts);
+                }
+            }
+            if (_cookieHealing)
+            {
+                _cookieHealing = false;
+                _initFailed = true;
+                logger.LogWarning("Cookie 后台自愈已耗尽重试次数，空间功能暂不可用（将在用即刷/周期刷新/失效自救时继续尝试）");
+            }
+        });
+    }
+
     private async Task EnsureApiAsync()
     {
         if (_api != null && !_initFailed)
         {
+            // 用即刷：距上次刷新超过节流间隔则顺手刷新
             var onUse = ParseIntervalSeconds(Configuration.CookieRefreshOnUse, "m");
             if (Configuration.AutoRefreshCookie && onUse > 0 && (DateTime.Now - _lastCookieRefresh).TotalSeconds > onUse)
             {
@@ -525,11 +597,21 @@ public class QzoneModule(
             return;
         }
 
+        if (_cookieHealing)
+            throw new Exception("QQ空间 Cookie 正在后台自动获取中，请稍后再试");
+
         if (Configuration.AutoRefreshCookie)
         {
             try
             {
                 if (await RefreshCookieAsync(false)) return;
+                // 刷新失败但存在旧会话：用保活探针验证旧会话仍可用则继续
+                if (_session.HasContext && await CheckSessionAliveAsync())
+                {
+                    _initFailed = false;
+                    logger.LogInformation("Cookie 刷新失败但旧会话仍然可用，继续工作");
+                    return;
+                }
             }
             catch (Exception e)
             {
@@ -537,32 +619,26 @@ public class QzoneModule(
             }
         }
 
-        if (_api == null)
+        if (!_session.HasContext)
         {
-            if (string.IsNullOrEmpty(Configuration.CookiesStr))
-                throw new Exception("未配置QQ空间Cookie，请在插件配置中填写cookies_str");
-            _ctx = QzoneSession.BuildContext(Configuration.CookiesStr);
-            _myUin = _ctx.Uin;
-            if (_myUin == 0)
-                throw new Exception("Cookie 中未解析到有效 QQ 号（uin），会话不可用");
-            _api = new QzoneApi(_ctx, Configuration.Timeout);
-            _initFailed = false;
-            logger.LogInformation("QQ空间登录成功 uin={Uin}", _myUin);
+            try { _session.GetCtx(); }
+            catch (Exception e) { throw new Exception($"QQ空间会话不可用：{e.Message}"); }
         }
-        else if (_initFailed)
-        {
-            throw new Exception("QQ空间会话不可用：Cookie 失效且自动刷新失败，请检查 OneBot 连接或手动更新 Cookie");
-        }
-        await Task.CompletedTask;
+        _myUin = _session.GetCtx().Uin;
+        if (_myUin == 0)
+            throw new Exception("Cookie 中未解析到有效 QQ 号（uin），会话不可用");
+        _initFailed = false;
+        logger.LogInformation("QQ空间会话就绪 uin={Uin}", _myUin);
     }
 
     private async Task ThrottleWriteAsync()
     {
+        // 透明节流：只延迟不拦截，相邻写间隔 = 配置值 + 抖动
+        var min = Configuration.WriteThrottleSeconds;
         var elapsed = DateTime.Now - _lastWriteTime;
-        if (elapsed.TotalSeconds < Configuration.WriteThrottleSeconds)
-        {
-            await Task.Delay(TimeSpan.FromSeconds(Configuration.WriteThrottleSeconds) - elapsed);
-        }
+        var wait = min + Random.Shared.NextDouble() * Configuration.LikeDelayJitter - elapsed.TotalSeconds;
+        if (wait > 0)
+            await Task.Delay(TimeSpan.FromSeconds(wait));
         _lastWriteTime = DateTime.Now;
     }
 
@@ -586,23 +662,21 @@ public class QzoneModule(
         }
     }
 
-    // ==================== 发送者识别（从聊天历史解析） ====================
+    // ==================== 发送者/场合识别（结构化优先，历史正则兜底） ====================
 
-    private string? GetSenderId()
+    private string? GetCurrentSessionId()
     {
         try
         {
             foreach (var content in ChatBot.ChatHistory.Reverse())
             {
-                if (content.Role != AuthorRole.User) continue;
+                if (content.Role != Microsoft.SemanticKernel.ChatCompletion.AuthorRole.User) continue;
                 var text = content.Content ?? "";
-                if (text.StartsWith("[来自系统的杂项消息推送]") || text.StartsWith("[消息来源(")) continue;
-                // 群聊格式：[群聊消息(群号,群名)] [QQ(昵称)]:内容
-                var m = Regex.Match(text, @"\[(\d{5,})(?:\([^\)]*\))?\]");
-                if (m.Success) return m.Groups[1].Value;
-                // 私聊格式：[私聊消息(QQ)]
+                if (text.StartsWith(ChatBot.PokeMessageTag) || text.StartsWith("[消息来源(")) continue;
+                var m = Regex.Match(text, @"\[群聊消息\((\d+)");
+                if (m.Success) return $"qq:gm:{m.Groups[1].Value}";
                 m = Regex.Match(text, @"\[私聊消息\((\d+)\)\]");
-                if (m.Success) return m.Groups[1].Value;
+                if (m.Success) return $"qq:dm:{m.Groups[1].Value}";
                 return null;
             }
         }
@@ -610,117 +684,246 @@ public class QzoneModule(
         return null;
     }
 
-    // ==================== 定时任务 ====================
+    private string? GetSenderId()
+    {
+        try
+        {
+            // 结构化优先：当前会话最近一条真实消息的发送者
+            var sid = GetCurrentSessionId();
+            if (sid != null && _lastSenderBySource.TryGetValue(sid, out var sender)
+                && (DateTime.Now - sender.Time).TotalMinutes < 30)
+                return sender.UserId.ToString();
+
+            // 历史正则兜底
+            foreach (var content in ChatBot.ChatHistory.Reverse())
+            {
+                if (content.Role != Microsoft.SemanticKernel.ChatCompletion.AuthorRole.User) continue;
+                var text = content.Content ?? "";
+                // 系统消息/定时任务指令：内部调用
+                if (text.StartsWith(ChatBot.PokeMessageTag) || text.StartsWith("[System 定时任务指令]"))
+                    return "system";
+                if (text.StartsWith("[消息来源(")) continue;
+                // 群聊消息体格式：[群聊消息(群号,群名)] [QQ(昵称)]:内容
+                if (text.Contains("[群聊消息("))
+                {
+                    var m = Regex.Match(text, @"\]\s*\[(\d{5,})(?:\([^\)]*\))?\]\s*[:：]");
+                    if (m.Success) return m.Groups[1].Value;
+                    return null;
+                }
+                // 私聊：源 tag 即发送者
+                var mp = Regex.Match(text, @"\[私聊消息\((\d+)\)\]");
+                if (mp.Success) return mp.Groups[1].Value;
+                return null;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // ==================== OneBot 实时事件（图片登记 + 发送者识别） ====================
+
+    private void TrySubscribeOneBotEvents()
+    {
+        if (_eventSubscribed) return;
+        try
+        {
+            var client = GetClient();
+            if (client == null) return;
+            client.EventReceived += OnOneBotEvent;
+            _eventSubscribed = true;
+            logger.LogInformation("已订阅 OneBot 实时事件（图片登记/发送者识别）");
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "订阅 OneBot 事件失败");
+        }
+    }
+
+    private void OnOneBotEvent(OneBotBaseEvent oneBotEvent)
+    {
+        try
+        {
+            if (oneBotEvent is not OneBotMessageEvent msg) return;
+            var sid = msg.MessageType == OneBotMessageType.Group
+                ? $"qq:gm:{msg.GroupId}"
+                : $"qq:dm:{msg.UserId}";
+            _lastSenderBySource[sid] = (msg.UserId, DateTime.Now);
+
+            if (!Configuration.ImageManifestEnabled || Configuration.AutoAttachRecentImage) return;
+            var sender = msg.Sender?.Nickname ?? msg.Sender?.Card ?? "";
+            foreach (var url in ExtractImageUrls(msg))
+                RegisterImage(sid, url, sender, msg.Time, "");
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "处理 OneBot 事件异常");
+        }
+    }
+
+    /// <summary>从消息中提取图片 URL（CQ 码字符串 / 消息段数组两种形态）</summary>
+    private static List<string> ExtractImageUrls(OneBotMessageEvent msg)
+    {
+        var urls = new List<string>();
+        try
+        {
+            if (msg.Message is string cq)
+            {
+                foreach (Match m in Regex.Matches(cq, @"\[CQ:image[^\]]*?url=([^\],\]]+)"))
+                    urls.Add(QzoneParser.CleanUrl(m.Groups[1].Value));
+            }
+            else if (msg.Message is JsonElement je && je.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var seg in je.EnumerateArray())
+                {
+                    if (seg.TryGetProperty("type", out var tp) && tp.GetString() == "image" &&
+                        seg.TryGetProperty("data", out var data) && data.TryGetProperty("url", out var url))
+                    {
+                        var u = QzoneParser.CleanUrl(url.GetString() ?? "");
+                        if (!string.IsNullOrEmpty(u)) urls.Add(u);
+                    }
+                }
+            }
+            else if (!string.IsNullOrEmpty(msg.RawMessage))
+            {
+                foreach (Match m in Regex.Matches(msg.RawMessage, @"\[CQ:image[^\]]*?url=([^\],\]]+)"))
+                    urls.Add(QzoneParser.CleanUrl(m.Groups[1].Value));
+            }
+        }
+        catch { }
+        return urls;
+    }
+
+    private void RegisterImage(string sid, string url, string? sender, long time, string? msgId)
+    {
+        if (string.IsNullOrEmpty(url)) return;
+        lock (_imageRegistry)
+        {
+            if (!_imageRegistry.TryGetValue(sid, out var registry))
+            {
+                registry = new List<ImageEntry>();
+                _imageRegistry[sid] = registry;
+            }
+            if (registry.Any(e => e.Url == url)) return;
+            registry.Add(new ImageEntry { Source = "url", Url = url, Sender = sender, Time = time, MsgId = msgId });
+            if (registry.Count > QzoneState.ImageRegistryCap)
+                registry.RemoveRange(0, registry.Count - QzoneState.ImageRegistryCap);
+        }
+    }
+
+    // ==================== 近期图片清单自动注入（PokeSend 过滤器） ====================
+
+    private string OnPokeSendFilter(string message)
+    {
+        try
+        {
+            if (!Configuration.ImageManifestEnabled || Configuration.AutoAttachRecentImage) return message;
+            string? sid = null;
+            var mg = Regex.Match(message, @"\[群聊消息\((\d+)");
+            if (mg.Success) sid = $"qq:gm:{mg.Groups[1].Value}";
+            else
+            {
+                var mp = Regex.Match(message, @"\[私聊消息\((\d+)\)\]");
+                if (mp.Success) sid = $"qq:dm:{mp.Groups[1].Value}";
+            }
+            if (sid == null) return message;
+
+            List<ImageEntry> entries;
+            lock (_imageRegistry)
+            {
+                if (!_imageRegistry.TryGetValue(sid, out var registry) || registry.Count == 0)
+                    return message;
+                entries = registry.TakeLast(Configuration.ImageManifestCount).ToList();
+            }
+
+            var lines = new List<string>();
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                // 惰性识图：无描述时起后台任务，本轮占位、下轮生效（识图资格与候选资格解耦）
+                if (string.IsNullOrEmpty(entry.Desc) && !entry.DescPending)
+                {
+                    entry.DescPending = true;
+                    var e1 = entry;
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var desc = await DescribeImageUrlAsync(e1.Url ?? "");
+                            if (!string.IsNullOrEmpty(desc)) e1.Desc = desc;
+                        }
+                        catch { }
+                        finally { e1.DescPending = false; }
+                    });
+                }
+                var timeStr = DateTimeOffset.FromUnixTimeSeconds(entry.Time).LocalDateTime.ToString("MM-dd HH:mm");
+                var sender = string.IsNullOrEmpty(entry.Sender) ? "未知" : entry.Sender;
+                lines.Add($"{i + 1}. [{timeStr} {sender}] {QzoneImagePolicy.CandidateLabel(entry.Desc)}");
+            }
+
+            return message + "\n\n[近期图片] 本会话最近出现的图片及内容描述，调用 qzone_publish 发说说时可用 image_indices 参数引用序号配图：\n"
+                + string.Join("\n", lines);
+        }
+        catch { return message; }
+    }
+
+    // ==================== 定时任务（cron/interval+抖动，60s防抖，作息黑名单） ====================
 
     private void SetupScheduledJobs()
     {
-        if (_jobsAdded) return;
-
-        var publishSched = ParseSchedule(Configuration.AutoPublishSchedule);
-        if (publishSched != null)
+        void AddJob(string name, string? expr, Func<Task> run)
         {
-            _autoPublishTimer = new Timer(_ => _ = AutoPublishJobAsync(), null,
-                TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(publishSched.Value.IntervalSeconds > 0 ? publishSched.Value.IntervalSeconds : 3600));
-            logger.LogInformation("自动发布定时任务已调度: {Schedule}", Configuration.AutoPublishSchedule);
+            var next = BuildSchedule(expr);
+            if (next == null) return;
+            var job = new ScheduledJob { Name = name, Run = run, NextAfter = next };
+            job.NextRun = next(DateTime.Now);
+            _jobs.Add(job);
+            logger.LogInformation("定时任务已调度: {Name} ({Expr})，下次执行 {Next}", name, expr, job.NextRun);
         }
 
-        var commentSched = ParseSchedule(Configuration.AutoCommentSchedule);
-        if (commentSched != null)
-        {
-            _autoCommentTimer = new Timer(_ => _ = AutoCommentJobAsync(), null,
-                TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(commentSched.Value.IntervalSeconds > 0 ? commentSched.Value.IntervalSeconds : 3600));
-            logger.LogInformation("自动评论定时任务已调度: {Schedule}", Configuration.AutoCommentSchedule);
-        }
-
+        AddJob("自动发布", Configuration.AutoPublishSchedule, AutoPublishJobAsync);
+        AddJob("自动评论", Configuration.AutoCommentSchedule, AutoCommentJobAsync);
         if (Configuration.AutoReplyEnabled)
-        {
-            var replySched = ParseSchedule(Configuration.AutoReplySchedule);
-            if (replySched != null)
-            {
-                _autoReplyTimer = new Timer(_ => _ = AutoReplyJobAsync(), null,
-                    TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(replySched.Value.IntervalSeconds > 0 ? replySched.Value.IntervalSeconds : 3600));
-                logger.LogInformation("自动回复定时任务已调度: {Schedule}", Configuration.AutoReplySchedule);
-            }
-        }
+            AddJob("自动回复", Configuration.AutoReplySchedule, AutoReplyJobAsync);
 
-        _jobsAdded = true;
+        if (_jobs.Count > 0)
+            _scheduleTimer = new Timer(_ => _ = ScheduleTickAsync(), null,
+                TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(15));
     }
 
-    private async Task AutoPublishJobAsync()
+    private async Task ScheduleTickAsync()
     {
-        if (IsInBlackout()) return;
-        try
+        var now = DateTime.Now;
+        foreach (var job in _jobs)
         {
-            await EnsureApiAsync();
-            var targetImageCount = Random.Shared.Next(Configuration.AutoPublishImageMin, Configuration.AutoPublishImageMax + 1);
-            logger.LogInformation("定时自动发布配图目标: target={Target} range={Min}-{Max}",
-                targetImageCount, Configuration.AutoPublishImageMin, Configuration.AutoPublishImageMax);
-
-            var taskGroups = Configuration.TaskGroupIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            var taskPrivates = Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            if (taskGroups.Count > 0 || taskPrivates.Count > 0)
+            if (now < job.NextRun) continue;
+            // misfire 容错：错过 300s 以内补跑，超过则跳到下一轮
+            if ((now - job.NextRun).TotalSeconds > 300)
             {
-                var instruction = "【定时任务】请根据最近聊天发布一条说说，自然一点，不要提及这是定时任务。";
-                if (targetImageCount > 0)
-                    instruction += $"本次必须选择恰好{targetImageCount}个不同序号；候选不足时选择全部可用候选。配图时用image_indices选择，也可用images传聊天记录里见过的图片URL或本地路径。";
-                else
-                    instruction += "可按内容自主选择配图；不适合配图时不要配图。配图时用image_indices选择，也可用images传聊天记录里见过的图片URL或本地路径。";
-                await SendTaskInstructionAsync(instruction, true);
-                return;
+                job.NextRun = job.NextAfter(now);
+                continue;
             }
+            // 60 秒防抖
+            if ((now - job.LastExecuted).TotalSeconds < 60) continue;
+            job.LastExecuted = now;
+            job.NextRun = job.NextAfter(now);
 
-            await LegacyAutoPublishAsync(targetImageCount);
-        }
-        catch (Exception e)
-        {
-            logger.LogError(e, "自动发布任务失败");
+            if (IsInBlackout())
+            {
+                logger.LogInformation("定时任务 {Name} 处于黑名单时间段，跳过本轮", job.Name);
+                continue;
+            }
+            try
+            {
+                await job.Run();
+            }
+            catch (Exception e)
+            {
+                logger.LogError(e, "定时任务 {Name} 执行失败", job.Name);
+            }
         }
     }
 
-    private async Task AutoCommentJobAsync()
-    {
-        if (IsInBlackout()) return;
-        try
-        {
-            await EnsureApiAsync();
-            var taskGroups = Configuration.TaskGroupIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            var taskPrivates = Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            if (taskGroups.Count > 0 || taskPrivates.Count > 0)
-            {
-                var instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点和简洁（0-15字内）。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。";
-                await SendTaskInstructionAsync(instruction, false);
-                return;
-            }
-            await LegacyAutoCommentAsync();
-        }
-        catch (Exception e)
-        {
-            logger.LogError(e, "自动评论任务失败");
-        }
-    }
-
-    private async Task AutoReplyJobAsync()
-    {
-        if (IsInBlackout()) return;
-        try
-        {
-            await EnsureApiAsync();
-            var taskGroups = Configuration.TaskGroupIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            var taskPrivates = Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            if (taskGroups.Count > 0 || taskPrivates.Count > 0)
-            {
-                var instruction = "【回复任务】请回复你最近说说下的新评论，使用qzone_reply_comment和评论自身的ID、UIN准确回复，target_id为自己的QQ号。自然一点和简洁（0-15字内），严禁内容重复和复读。根据评论作者UIN不回复自己，优先没有回复过的用户和新回复，否则不回复。";
-                await SendTaskInstructionAsync(instruction, false);
-                return;
-            }
-            await LegacyAutoReplyAsync();
-        }
-        catch (Exception e)
-        {
-            logger.LogError(e, "自动回复任务失败");
-        }
-    }
-
+    /// <summary>任务指令：注入会话让 AI 以完整人设/记忆自主执行（对齐 Kira 群聊指令模式）</summary>
     private async Task SendTaskInstructionAsync(string instruction, bool withPlace)
     {
         var targets = new List<(string Type, string Id)>();
@@ -733,6 +936,7 @@ public class QzoneModule(
         var (type, id) = targets[Random.Shared.Next(targets.Count)];
         if (withPlace)
         {
+            // 附带场合信息（群名/昵称）
             try
             {
                 var client = GetClient();
@@ -759,10 +963,84 @@ public class QzoneModule(
             catch { }
         }
 
+        // silent：提示 AI 不要向群/私聊发送回复（Alife 无会话管线事件，用人设层提示实现无痕）
+        if (Configuration.TaskMessageStyle.Equals("silent", StringComparison.OrdinalIgnoreCase))
+            instruction += "\n（静默任务：直接执行空间操作即可，不要通过QChat/QImage向任何群聊或私聊发送消息）";
+
         interactor.Poke($"[System 定时任务指令] {instruction}");
         logger.LogInformation("已发送定时任务指令: {Instruction}", instruction[..Math.Min(30, instruction.Length)]);
-        await Task.CompletedTask;
     }
+
+    private async Task AutoPublishJobAsync()
+    {
+        try
+        {
+            await EnsureApiAsync();
+            var targetImageCount = QzoneImagePolicy.DrawTarget(Configuration.AutoPublishImageMin, Configuration.AutoPublishImageMax);
+            logger.LogInformation("定时自动发布配图目标: target={Target} range={Min}-{Max}",
+                targetImageCount, Configuration.AutoPublishImageMin, Configuration.AutoPublishImageMax);
+
+            var hasTargets = Configuration.TaskGroupIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0
+                || Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0;
+            if (hasTargets)
+            {
+                var instruction = "【定时任务】请根据最近聊天发布一条说说，自然一点，不要提及这是定时任务。"
+                    + QzoneImagePolicy.BuildInstruction(targetImageCount, Configuration.AutoPublishImageMax)
+                    + "配图时用image_indices选择，也可用images传聊天记录里见过的图片URL或本地路径。";
+                await SendTaskInstructionAsync(instruction, true);
+                return;
+            }
+            await LegacyAutoPublishAsync(targetImageCount);
+        }
+        catch (Exception e)
+        {
+            logger.LogError(e, "自动发布任务失败");
+        }
+    }
+
+    private async Task AutoCommentJobAsync()
+    {
+        try
+        {
+            await EnsureApiAsync();
+            var hasTargets = Configuration.TaskGroupIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0
+                || Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0;
+            if (hasTargets)
+            {
+                var instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点和简洁（0-15字内）。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。";
+                await SendTaskInstructionAsync(instruction, false);
+                return;
+            }
+            await LegacyAutoCommentAsync();
+        }
+        catch (Exception e)
+        {
+            logger.LogError(e, "自动评论任务失败");
+        }
+    }
+
+    private async Task AutoReplyJobAsync()
+    {
+        try
+        {
+            await EnsureApiAsync();
+            var hasTargets = Configuration.TaskGroupIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0
+                || Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0;
+            if (hasTargets)
+            {
+                var instruction = "【回复任务】请回复你最近说说下的新评论，使用qzone_reply_comment和评论自身的ID、UIN准确回复，target_id为自己的QQ号。自然一点和简洁（0-15字内），严禁内容重复和复读。根据评论作者UIN不回复自己，优先没有回复过的用户和新回复，否则不回复。";
+                await SendTaskInstructionAsync(instruction, false);
+                return;
+            }
+            await LegacyAutoReplyAsync();
+        }
+        catch (Exception e)
+        {
+            logger.LogError(e, "自动回复任务失败");
+        }
+    }
+
+    // ==================== 后台直接生成模式（Legacy） ====================
 
     private async Task LegacyAutoPublishAsync(int targetImageCount)
     {
@@ -795,9 +1073,9 @@ public class QzoneModule(
         }
 
         var systemPrompt = "";
-        if (_myPostsHistory.Count > 0)
+        if (_state.MyPostsHistory.Count > 0)
         {
-            var historyStr = string.Join("\n", _myPostsHistory.TakeLast(5).Select(p => $"- {p}"));
+            var historyStr = string.Join("\n", _state.MyPostsHistory.TakeLast(5).Select(p => $"- {p}"));
             systemPrompt += $"\n\n你最近发布的说说是：\n{historyStr}";
         }
 
@@ -809,24 +1087,24 @@ public class QzoneModule(
         }
         else
         {
-            prompt = "请生成一条QQ空间说说，内容可以是心情、日常、段子，20-50字";
+            prompt = "请生成一条QQ空间说说，内容可以是心情、日常、段子，20-50字，要符合你的人设。";
         }
 
         var imageUrls = new List<string>();
         var shouldOfferImages = Configuration.AutoPublishImageProb > 0 && Random.Shared.NextDouble() < Configuration.AutoPublishImageProb;
-        if (shouldOfferImages)
+        if (shouldOfferImages && !string.IsNullOrEmpty(sourceId))
         {
             try
             {
                 var candidates = await FetchRecentImagesAsync(sourceType, sourceId, Math.Max(Configuration.AutoPublishImageMax, targetImageCount));
-                candidates = candidates.Where(u => !IsRecentlyPublishedImage(u)).ToList();
+                candidates = QzoneImagePolicy.DedupeSources(candidates).Where(u => !IsRecentlyPublishedImage(u)).ToList();
                 if (candidates.Count > 0)
                 {
                     var descLines = new List<string>();
                     for (int i = 0; i < candidates.Count; i++)
                     {
                         var desc = await DescribeImageUrlAsync(candidates[i]);
-                        descLines.Add($"{i + 1}. {desc}");
+                        descLines.Add($"{i + 1}. {QzoneImagePolicy.CandidateLabel(desc)}");
                     }
                     if (descLines.Count > 0)
                     {
@@ -836,7 +1114,8 @@ public class QzoneModule(
                         prompt += "\n\n以下是最近聊天中出现的图片及内容描述：\n" + string.Join("\n", descLines) + "\n" + choiceRule + "正文后另起一行输出 IMG:序号 或 IMG:序号,序号。";
                         var textWithChoice = await CallLlmAsync(prompt, systemPrompt);
                         var (text, chosen) = SplitImgChoices(textWithChoice);
-                        imageUrls = ResolveDescribedSources(candidates, chosen, targetImageCount, Configuration.AutoPublishImageMax);
+                        if (chosen.Count > 0 || targetImageCount == 0 || Configuration.AutoPublishImageFallback)
+                            imageUrls = QzoneImagePolicy.ResolveDescribedSources(candidates, chosen, targetImageCount, Configuration.AutoPublishImageMax);
                         if (!string.IsNullOrEmpty(text)) prompt = text;
                     }
                 }
@@ -857,8 +1136,9 @@ public class QzoneModule(
         var result = await _api!.PublishAsync(finalText, imageUrls, allowImageDrop: true);
         if (result.Ok)
         {
-            _myPostsHistory.Add(finalText);
-            SaveState();
+            _state.MyPostsHistory.Add(finalText);
+            RecordPublishedImages(imageUrls);
+            _state.Save();
             logger.LogInformation("自动发布说说成功: {Text} (图片数: {Count})", finalText, imageUrls.Count);
         }
         else
@@ -881,6 +1161,13 @@ public class QzoneModule(
             foreach (var post in selected)
             {
                 var prompt = $"根据以下说说内容，生成一条简洁评论（0-15字）：\n{post.Text}";
+                // 可选：评论前先识图
+                if (Configuration.AutoCommentImageDesc && post.Images.Count > 0)
+                {
+                    var desc = await DescribeImageUrlAsync(post.Images[0]);
+                    if (!string.IsNullOrEmpty(desc))
+                        prompt += $"\n该说说配图内容：{desc}";
+                }
                 var commentText = await CallLlmAsync(prompt, "");
                 if (string.IsNullOrEmpty(commentText)) continue;
                 try
@@ -888,11 +1175,7 @@ public class QzoneModule(
                     var result = await CommentAsync(post, commentText);
                     logger.LogInformation("自动评论成功: {Tid} -> {Text}", post.Tid, commentText);
                     if (Configuration.LikeWhenComment && !result.Contains("未重复提交"))
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(Random.Shared.NextDouble() * Configuration.LikeDelayJitter + Configuration.LikeDelayMin));
-                        var likeResp = await _api!.LikeAsync(post, post.CreateTime);
-                        if (likeResp.Ok) logger.LogInformation("自动点赞成功: {Tid}", post.Tid);
-                    }
+                        await AutoLikeAfterCommentAsync(post);
                 }
                 catch (Exception e)
                 {
@@ -928,8 +1211,9 @@ public class QzoneModule(
                 foreach (var comment in fullPost.Comments)
                 {
                     if (comment.Uin == _myUin) continue;
+                    // 组合键去重：说说+评论ID+作者UIN（主评论与楼中回复 ID 可重复）
                     var replyKey = $"{fullPost.Tid}:{comment.Tid}:{comment.Uin}";
-                    if (_repliedComments.Contains(replyKey)) continue;
+                    if (_state.RepliedComments.Contains(replyKey)) continue;
 
                     var (_, promptContent) = ParseCommentContent(comment.Content);
                     var prompt = $"用户 {comment.Nickname} 评论了你的说说：{promptContent}，请生成一条简洁回复（0-15字）。";
@@ -944,8 +1228,8 @@ public class QzoneModule(
                         continue;
                     }
                     logger.LogInformation("自动回复成功: {Tid}/{Uin} -> {Text}", comment.Tid, comment.Uin, replyText);
-                    _repliedComments.Add(replyKey);
-                    SaveState();
+                    _state.RepliedComments.Add(replyKey);
+                    _state.Save();
                     newReplies++;
                     await Task.Delay(TimeSpan.FromSeconds(Random.Shared.NextDouble() * 1.0 + 0.5));
                     if (newReplies >= Configuration.MaxRepliesPerCycle) break;
@@ -963,11 +1247,21 @@ public class QzoneModule(
 
     private bool IsRecentlyPublishedImage(string url)
     {
+        var dedupeInterval = ParseIntervalSeconds(Configuration.AutoPublishImageDedupeInterval, "h");
+        if (dedupeInterval <= 0) return false;
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var dedupeInterval = ParseIntervalSeconds("3d", "h");
-        return _publishedImageHistory.Any(h =>
-            h.TryGetValue("identity", out var id) && id?.ToString() == url &&
-            h.TryGetValue("time", out var t) && Convert.ToInt64(t) > now - dedupeInterval);
+        return _state.PublishedImageHistory.Any(h => h.Identity == url && h.Time > now - dedupeInterval);
+    }
+
+    /// <summary>仅发布成功后记录配图指纹（对齐 Kira：去重仅成功后记录）</summary>
+    private void RecordPublishedImages(List<string> urls)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        foreach (var url in urls)
+        {
+            var identity = _urlMd5.GetValueOrDefault(url) ?? url;
+            _state.PublishedImageHistory.Add(new QzoneState.PublishedImageRecord { Identity = identity, Time = now });
+        }
     }
 
     private async Task<List<string>> FetchChatHistoryAsync(string sourceType, string sourceId, int count)
@@ -995,38 +1289,29 @@ public class QzoneModule(
             foreach (var m in msgs.EnumerateArray()) messages.Add(m);
         }
 
-        if (Configuration.ImageManifestEnabled)
+        if (Configuration.ImageManifestEnabled && !Configuration.AutoAttachRecentImage)
         {
             var sid = $"qq:{(sourceType == "group" ? "gm" : "dm")}:{sourceId}";
-            if (!_imageRegistry.TryGetValue(sid, out var registry))
-            {
-                registry = new List<ImageEntry>();
-                _imageRegistry[sid] = registry;
-            }
             foreach (var msg in messages)
             {
                 var sender = "";
                 if (msg.TryGetProperty("sender", out var s) && s.TryGetProperty("nickname", out var n))
                     sender = n.GetString() ?? "";
                 var msgId = msg.TryGetProperty("message_id", out var mid) ? mid.ToString() : "";
-                var timestamp = msg.TryGetProperty("time", out var t) ? t.GetInt64() : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                if (msg.TryGetProperty("message", out var segs))
+                var timestamp = msg.TryGetProperty("time", out var t) && t.TryGetInt64(out var tv)
+                    ? tv : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (msg.TryGetProperty("message", out var segs) && segs.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var seg in segs.EnumerateArray())
                     {
                         if (seg.TryGetProperty("type", out var tp) && tp.GetString() == "image" &&
                             seg.TryGetProperty("data", out var data) && data.TryGetProperty("url", out var url))
                         {
-                            var u = System.Net.WebUtility.HtmlDecode(url.GetString() ?? "").Trim().Trim('"').Trim('\'');
-                            if (!string.IsNullOrEmpty(u) && !registry.Any(e => e.Url == u))
-                            {
-                                registry.Add(new ImageEntry { Source = "url", Url = u, Sender = sender, Time = timestamp, MsgId = msgId });
-                            }
+                            RegisterImage(sid, QzoneParser.CleanUrl(url.GetString() ?? ""), sender, timestamp, msgId);
                         }
                     }
                 }
             }
-            if (registry.Count > ImageRegistryCap) registry.RemoveRange(0, registry.Count - ImageRegistryCap);
         }
         return messages;
     }
@@ -1037,14 +1322,14 @@ public class QzoneModule(
         var urls = new List<string>();
         foreach (var msg in messages.AsEnumerable().Reverse())
         {
-            if (msg.TryGetProperty("message", out var segs))
+            if (msg.TryGetProperty("message", out var segs) && segs.ValueKind == JsonValueKind.Array)
             {
                 foreach (var seg in segs.EnumerateArray())
                 {
                     if (seg.TryGetProperty("type", out var tp) && tp.GetString() == "image" &&
                         seg.TryGetProperty("data", out var data) && data.TryGetProperty("url", out var url))
                     {
-                        var u = System.Net.WebUtility.HtmlDecode(url.GetString() ?? "").Trim().Trim('"').Trim('\'');
+                        var u = QzoneParser.CleanUrl(url.GetString() ?? "");
                         if (!string.IsNullOrEmpty(u))
                         {
                             urls.Add(u);
@@ -1060,7 +1345,7 @@ public class QzoneModule(
     private static string ExtractTextSimple(JsonElement msg)
     {
         var texts = new List<string>();
-        if (msg.TryGetProperty("message", out var segs))
+        if (msg.TryGetProperty("message", out var segs) && segs.ValueKind == JsonValueKind.Array)
         {
             foreach (var seg in segs.EnumerateArray())
             {
@@ -1074,28 +1359,84 @@ public class QzoneModule(
         return string.Join(" ", texts);
     }
 
+    /// <summary>
+    /// 描述图片内容：md5 全局缓存优先（命中零 VLM 调用，省 token）；
+    /// 未命中下载 → VLM 识图 → 写缓存。临时文件即用即删。
+    /// </summary>
     private async Task<string> DescribeImageUrlAsync(string url)
     {
         if (string.IsNullOrEmpty(url)) return "";
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            var bytes = await http.GetByteArrayAsync(url);
-            if (bytes.Length == 0) return "";
+            var bytes = await QzoneParser.DownloadImageAsync(url);
+            if (bytes == null || bytes.Length == 0) return "";
             var md5 = Convert.ToHexString(MD5.HashData(bytes)).ToLower();
             _urlMd5[url] = md5;
+
+            // 全局 md5 缓存：命中直接返回
+            var cached = _state.GetImageDesc(md5);
+            if (!string.IsNullOrEmpty(cached)) return cached;
+
             if (visionModel == null)
                 return $"[图片 {md5[..8]}]";
             var tempPath = Path.Combine(Path.GetTempPath(), $"qzone_img_{md5[..8]}.jpg");
-            await File.WriteAllBytesAsync(tempPath, bytes);
-            var desc = await visionModel.QueryAsync(tempPath, "请精简的描述一下图片大体内容，避免输出过多的文本", 64);
-            return string.IsNullOrEmpty(desc) ? $"[图片 {md5[..8]}]" : desc;
+            try
+            {
+                await File.WriteAllBytesAsync(tempPath, bytes);
+                var desc = await visionModel.QueryAsync(tempPath, "请精简的描述一下图片大体内容，避免输出过多的文本", 64);
+                if (!string.IsNullOrEmpty(desc))
+                {
+                    _state.SetImageDesc(md5, desc);
+                    _state.Save();
+                    return desc;
+                }
+                return $"[图片 {md5[..8]}]";
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            }
         }
         catch (Exception e)
         {
             logger.LogDebug(e, "图片描述失败: {Url}", url);
             return "";
         }
+    }
+
+    /// <summary>URL 过期续命：QQ 多媒体 rkey 约 1 小时过期，按 msg_id 调 get_msg 换新签名 URL</summary>
+    private async Task<bool> TryRefreshImageUrlAsync(ImageEntry entry)
+    {
+        if (string.IsNullOrEmpty(entry.MsgId)) return false;
+        try
+        {
+            var client = GetClient();
+            if (client == null) return false;
+            var result = await client.CallActionAsync<JsonElement>("get_msg", new { message_id = long.Parse(entry.MsgId) });
+            if (result.TryGetProperty("data", out var d) && d.TryGetProperty("message", out var segs)
+                && segs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var seg in segs.EnumerateArray())
+                {
+                    if (seg.TryGetProperty("type", out var tp) && tp.GetString() == "image" &&
+                        seg.TryGetProperty("data", out var data) && data.TryGetProperty("url", out var url))
+                    {
+                        var u = QzoneParser.CleanUrl(url.GetString() ?? "");
+                        if (!string.IsNullOrEmpty(u) && u != entry.Url)
+                        {
+                            entry.Url = u;
+                            logger.LogInformation("图片 URL 已通过 get_msg 续命 (msgId={MsgId})", entry.MsgId);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "图片 URL 续命失败 (msgId={MsgId})", entry.MsgId);
+        }
+        return false;
     }
 
     private static (string Text, List<int> Chosen) SplitImgChoices(string text)
@@ -1112,39 +1453,7 @@ public class QzoneModule(
         return (cleaned, chosen);
     }
 
-    private static List<string> ResolveDescribedSources(List<string> candidates, List<int> chosen, int target, int max)
-    {
-        var result = new List<string>();
-        if (target > 0)
-        {
-            foreach (var idx in chosen)
-            {
-                if (idx >= 1 && idx <= candidates.Count && !result.Contains(candidates[idx - 1]))
-                    result.Add(candidates[idx - 1]);
-                if (result.Count >= target) break;
-            }
-            if (result.Count < target)
-            {
-                foreach (var c in candidates)
-                {
-                    if (!result.Contains(c)) result.Add(c);
-                    if (result.Count >= target) break;
-                }
-            }
-        }
-        else
-        {
-            foreach (var idx in chosen)
-            {
-                if (idx >= 1 && idx <= candidates.Count && !result.Contains(candidates[idx - 1]))
-                    result.Add(candidates[idx - 1]);
-                if (result.Count >= max) break;
-            }
-        }
-        return result;
-    }
-
-    // ==================== 数据获取 ====================
+    // ==================== 数据获取与评论 ====================
 
     private async Task<List<QzonePost>> GetFeedsAsync(string? targetId, int num)
     {
@@ -1165,6 +1474,7 @@ public class QzoneModule(
         return posts.Take(num).ToList();
     }
 
+    /// <summary>评论说说：提交前本地幂等检查（零 token），接口成功即成功，不做回读误判</summary>
     private async Task<string> CommentAsync(QzonePost post, string content)
     {
         await EnsureApiAsync();
@@ -1191,9 +1501,60 @@ public class QzoneModule(
             logger.LogDebug(e, "评论前幂等检查失败（继续提交）");
         }
 
-        var resp = await _api!.CommentAsync(post.Uin, post.Tid, content);
+        var resp = await _api!.CommentAsync(post.Uin, post.Tid, content ?? "");
         if (!resp.Ok) throw new Exception($"评论接口失败: {resp.Message}");
+
+        // 诊断模式：提交后回读确认（仅日志，不阻断）
+        if (Configuration.CommentVerify)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(3));
+                    var verify = await _api!.GetDetailAsync(post.Uin, post.Tid);
+                    if (verify.Ok)
+                    {
+                        var parsed = QzoneParser.ParseFeeds(new List<object?> { verify.Data });
+                        var found = parsed.Count > 0 && parsed[0].Comments.Any(c =>
+                            c.Uin == _myUin && Regex.Replace(c.Content ?? "", @"\s+", "") == Regex.Replace(content ?? "", @"\s+", ""));
+                        if (!found)
+                            logger.LogWarning("评论回读未找到（可能被风控，通常约24h恢复）: {Tid} code={Code} msg={Msg}", post.Tid, resp.Code, resp.Message);
+                    }
+                }
+                catch { }
+            });
+        }
         return "评论成功";
+    }
+
+    /// <summary>评论后自动点赞：随机延迟错开特征；已赞跳过；详情缺 uin 时回填 target 防 unikey 拼错</summary>
+    private async Task AutoLikeAfterCommentAsync(QzonePost post)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(Random.Shared.NextDouble() * Configuration.LikeDelayJitter + Configuration.LikeDelayMin));
+            var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
+            if (detailResp.Ok)
+            {
+                var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                if (parsed.Count > 0)
+                {
+                    if (parsed[0].IsLiked)
+                    {
+                        logger.LogDebug("说说已赞过，跳过自动点赞: {Tid}", post.Tid);
+                        return;
+                    }
+                    if (parsed[0].CreateTime > 0) post.CreateTime = parsed[0].CreateTime;
+                }
+            }
+            var likeResp = await _api!.LikeAsync(post, post.CreateTime);
+            if (likeResp.Ok) logger.LogInformation("自动点赞成功: {Tid}", post.Tid);
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "评论后自动点赞失败: {Tid}", post.Tid);
+        }
     }
 
     // ==================== 生命周期 ====================
@@ -1201,7 +1562,7 @@ public class QzoneModule(
     protected override Task OnAwake()
     {
         XmlHandler xmlHandler = new(this) {
-            Description = "提供QQ空间说说发布、查看、点赞、评论、删除、访客统计、定时任务等功能"
+            Description = "提供QQ空间说说发布、查看、点赞、评论、回复、删除、访客统计、图片识图、定时任务等功能"
         };
         functionCaller.RegisterHandler(xmlHandler, DocumentMode.Implicit, DestroyCancellationToken);
 
@@ -1218,33 +1579,87 @@ public class QzoneModule(
                 _blackoutTimes.Add((start, end));
         }
 
-        LoadState();
-        SetupScheduledJobs();
+        _state = new QzoneState(logger);
+        _state.Load();
 
-        var refreshInterval = ParseIntervalSeconds(Configuration.CookieRefreshInterval, "h");
-        if (Configuration.AutoRefreshCookie && refreshInterval > 0)
-        {
-            _cookieRefreshTimer = new Timer(_ => _ = RefreshCookieAsync(false), null,
-                TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(Math.Max(300, refreshInterval)));
-        }
+        // 会话与传输层：Cookie 原地刷新，失效自救回调挂传输层
+        _session = new QzoneSession(() => Configuration.CookiesStr);
+        _httpClient = new QzoneHttpClient(Configuration.Timeout, logger, () => _session.GetCtx());
+        _httpClient.OnAuthExpired = () => RefreshCookieAsync(force: true);
+        _api = new QzoneApi(_session, _httpClient);
+
+        // 近期图片清单注入（PokeSend 过滤器，随 QQ 消息一并送达 AI）
+        ChatBot.PokeSend += OnPokeSendFilter;
 
         return Task.CompletedTask;
     }
 
+    protected override async Task OnStart()
+    {
+        // 全部模块 Awake 完毕（QChat 的 OneBotClient 已创建），订阅实时事件
+        TrySubscribeOneBotEvents();
+
+        SetupScheduledJobs();
+
+        // Cookie 周期刷新（±10% 抖动，最小 300s）
+        var refreshInterval = ParseIntervalSeconds(Configuration.CookieRefreshInterval, "h");
+        if (Configuration.AutoRefreshCookie && refreshInterval > 0)
+        {
+            var interval = Math.Max(300, refreshInterval);
+            _cookieRefreshTimer = new Timer(_ =>
+            {
+                _ = RefreshCookieAsync(false);
+                // 每次触发后重排下次间隔（±10% 抖动）
+                try
+                {
+                    var jitter = interval * (0.9 + Random.Shared.NextDouble() * 0.2);
+                    _cookieRefreshTimer?.Change(TimeSpan.FromSeconds(jitter), TimeSpan.FromSeconds(jitter));
+                }
+                catch { }
+            }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(interval));
+        }
+
+        // 启动即尝试获取 Cookie；失败进入后台自愈（15/30/60/120s 递增重试，不判死）
+        if (Configuration.AutoRefreshCookie)
+        {
+            try
+            {
+                if (!await RefreshCookieAsync(force: true))
+                    StartCookieSelfHeal();
+            }
+            catch (Exception e)
+            {
+                logger.LogWarning(e, "启动时获取 Cookie 失败，进入后台自愈");
+                StartCookieSelfHeal();
+            }
+        }
+        else if (string.IsNullOrEmpty(Configuration.CookiesStr))
+        {
+            logger.LogWarning("未启用自动刷新且未配置 Cookie 字符串，空间功能不可用");
+        }
+    }
+
     protected override Task OnDestroy()
     {
+        ChatBot.PokeSend -= OnPokeSendFilter;
+        try
+        {
+            var client = GetClient();
+            if (client != null && _eventSubscribed)
+                client.EventReceived -= OnOneBotEvent;
+        }
+        catch { }
         _cookieRefreshTimer?.Dispose();
-        _autoPublishTimer?.Dispose();
-        _autoCommentTimer?.Dispose();
-        _autoReplyTimer?.Dispose();
-        SaveState();
+        _scheduleTimer?.Dispose();
+        _httpClient.Dispose();
+        _state?.Save();
         return Task.CompletedTask;
     }
 
     // ==================== 工具函数 ====================
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("发布一条说说到自己的QQ空间。配图方式：1) images参数传图片URL或本地路径；2) 先调用qzone_image_manifest获取[近期图片]清单，再用image_indices引用序号。都不传时默认纯文字发布。")]
+    [Description("发布一条说说到自己的QQ空间。配图方式：1) images参数传聊天中出现过的图片URL或本地路径；2) 先调用qzone_image_manifest获取[近期图片]清单，再用image_indices引用序号（QQ消息到来时清单也会随消息自动附上）。优先使用你真正了解内容的方式配图；都不传时默认纯文字发布。")]
     public async Task QzonePublish(
         [Description("说说内容")] string text,
         [Description("图片URL或本地路径列表(可选)")] string? images = null,
@@ -1263,18 +1678,38 @@ public class QzoneModule(
                 var resolved = await ResolveManifestImagesAsync(imageIndices);
                 if (resolved.Count == 0)
                 {
-                    interactor.Poke($"未能从[近期图片]清单解析出图片（清单为空或序号超出范围），说说未发布。如确认发纯文字，请不带image_indices重试；如想配图，可改用images参数传图片URL或本地路径。");
+                    interactor.Poke("未能从[近期图片]清单解析出图片（清单为空或序号超出范围），说说未发布。如确认发纯文字，请不带image_indices重试；如想配图，可改用images参数传图片URL或本地路径。");
                     return;
                 }
                 imgList.AddRange(resolved);
             }
 
-            var result = await _api!.PublishAsync(text, imgList, allowImageDrop: false);
+            // 吸附模式：未指定图片时盲抓最近一张图
+            if (imgList.Count == 0 && Configuration.AutoAttachRecentImage)
+            {
+                var sid = GetCurrentSessionId();
+                if (sid != null)
+                {
+                    lock (_imageRegistry)
+                    {
+                        if (_imageRegistry.TryGetValue(sid, out var registry) && registry.Count > 0)
+                        {
+                            var last = registry[^1].Url;
+                            if (!string.IsNullOrEmpty(last)) imgList.Add(last);
+                        }
+                    }
+                }
+            }
+
+            var result = await _api!.PublishAsync(text, imgList, allowImageDrop: imgList.Count > 0);
             if (result.Ok)
             {
-                _myPostsHistory.Add(text);
-                SaveState();
-                interactor.Poke($"发布成功 tid={result.Data.GetValueOrDefault("tid")}");
+                _state.MyPostsHistory.Add(text);
+                RecordPublishedImages(imgList);
+                _state.Save();
+                var msg = $"发布成功 tid={result.Data.GetValueOrDefault("tid")}";
+                if (!string.IsNullOrEmpty(result.Message)) msg += $"（{result.Message}）";
+                interactor.Poke(msg);
             }
             else
             {
@@ -1347,7 +1782,7 @@ public class QzoneModule(
                     logger.LogDebug(e, "拉取详情评论失败");
                 }
 
-                // 拉点赞列表
+                // 拉点赞列表（含 is_dolike 与自己昵称补偿）
                 try
                 {
                     var likeResp = await _api!.GetLikeListAsync(p);
@@ -1355,6 +1790,7 @@ public class QzoneModule(
                     {
                         var likeData = likeResp.Data;
                         var likeUsers = new List<string>();
+                        var likeUins = new List<string>();
                         if (likeData.GetValueOrDefault("like_uin_info") is List<object?> uinList)
                         {
                             foreach (var u in uinList)
@@ -1362,14 +1798,23 @@ public class QzoneModule(
                                 if (u is Dictionary<string, object?> uinDict)
                                 {
                                     var nick = uinDict.GetValueOrDefault("nick")?.ToString() ?? uinDict.GetValueOrDefault("fuin")?.ToString();
+                                    var fuin = uinDict.GetValueOrDefault("fuin")?.ToString() ?? uinDict.GetValueOrDefault("uin")?.ToString() ?? "";
                                     if (!string.IsNullOrEmpty(nick)) likeUsers.Add(nick);
+                                    if (!string.IsNullOrEmpty(fuin)) likeUins.Add(fuin);
                                 }
                             }
                         }
                         var total = Convert.ToInt32(likeData.GetValueOrDefault("total_number") ?? likeUsers.Count);
+                        var isDolike = likeData.GetValueOrDefault("is_dolike") is 1 or true or "1" or 1L;
+                        // 自己已赞但列表不含自己时，补真实昵称（我）：OneBot get_stranger_info 优先，cgi_personal_card 回退
+                        if ((isDolike || p.IsLiked) && _myUin != 0 && !likeUins.Contains(_myUin.ToString()))
+                        {
+                            var myNick = await GetMyNicknameAsync();
+                            if (!string.IsNullOrEmpty(myNick)) likeUsers.Insert(0, $"{myNick}（我）");
+                        }
                         if (total > 0 || likeUsers.Count > 0)
                         {
-                            p.LikeCount = total;
+                            p.LikeCount = Math.Max(total, likeUsers.Count);
                             p.LikeUsers = likeUsers;
                         }
                     }
@@ -1382,7 +1827,7 @@ public class QzoneModule(
                 lines.Add(line);
                 if (p.Comments.Count > 0)
                 {
-                    var shown = p.Comments.Take(3).ToList();
+                    var shown = p.Comments.Take(Math.Max(1, Configuration.ViewCommentMax)).ToList();
                     foreach (var cmt in shown)
                     {
                         var timeStr2 = FormatTime(cmt.CreateTime);
@@ -1417,6 +1862,39 @@ public class QzoneModule(
         }
     }
 
+    private string _myNickname = "";
+
+    /// <summary>获取自己真实昵称（防「我」昵称诈骗）：OneBot get_stranger_info 优先，cgi_personal_card 回退</summary>
+    private async Task<string> GetMyNicknameAsync()
+    {
+        if (!string.IsNullOrEmpty(_myNickname)) return _myNickname;
+        if (_myUin == 0) return "";
+        try
+        {
+            var client = GetClient();
+            if (client != null)
+            {
+                var info = await client.CallActionAsync<JsonElement>("get_stranger_info", new { user_id = _myUin });
+                if (info.TryGetProperty("data", out var d) && d.TryGetProperty("nickname", out var n))
+                {
+                    _myNickname = n.GetString() ?? "";
+                    if (!string.IsNullOrEmpty(_myNickname)) return _myNickname;
+                }
+            }
+        }
+        catch { }
+        try
+        {
+            var resp = await _api!.GetUserInfoAsync(_myUin);
+            if (resp.Ok)
+                _myNickname = resp.Data.GetValueOrDefault("nickname")?.ToString()
+                    ?? resp.Data.GetValueOrDefault("nick")?.ToString()
+                    ?? resp.Data.GetValueOrDefault("name")?.ToString() ?? "";
+        }
+        catch { }
+        return _myNickname;
+    }
+
     [XmlFunction(FunctionMode.OneShot)]
     [Description("给指定说说点赞，或取消已点的赞。用户要求点赞用默认action=like；用户要求取消点赞时必须传action=unlike。")]
     public async Task QzoneLike(
@@ -1441,13 +1919,39 @@ public class QzoneModule(
             await ThrottleWriteAsync();
             var post = new QzonePost { Uin = long.Parse(targetId), Tid = NormalizeTid(tid) };
 
+            // 先拉详情：取发布时间（abstime 必需）与已赞状态（防重复点赞）
+            try
+            {
+                var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
+                if (detailResp.Ok)
+                {
+                    var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                    if (parsed.Count > 0)
+                    {
+                        if (parsed[0].CreateTime > 0) post.CreateTime = parsed[0].CreateTime;
+                        post.IsLiked = parsed[0].IsLiked;
+                        if (!string.IsNullOrEmpty(parsed[0].LikeKey)) post.LikeKey = parsed[0].LikeKey;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                logger.LogDebug(e, "点赞前拉详情失败（继续提交）");
+            }
+
             if (action == "unlike")
             {
+                // 取消不做拦截（isliked 滞后，幂等无害）
                 var resp = await _api!.LikeAsync(post, post.CreateTime, unlike: true);
                 interactor.Poke(resp.Ok ? "取消点赞成功" : $"取消点赞失败：{resp.Message}");
                 return;
             }
 
+            if (post.IsLiked)
+            {
+                interactor.Poke("这条说说已经赞过了。");
+                return;
+            }
             var result = await _api!.LikeAsync(post, post.CreateTime);
             interactor.Poke(result.Ok ? "点赞成功" : $"点赞失败：{result.Message}");
         }
@@ -1458,7 +1962,7 @@ public class QzoneModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("评论指定的说说。")]
+    [Description("评论指定的说说。content 不传时根据说说内容自动生成一条简洁评论。")]
     public async Task QzoneComment(
         [Description("目标QQ号")] string targetId,
         [Description("说说ID")] string tid,
@@ -1480,12 +1984,30 @@ public class QzoneModule(
             await EnsureApiAsync();
             await ThrottleWriteAsync();
             var post = new QzonePost { Uin = long.Parse(targetId), Tid = NormalizeTid(tid) };
-            var result = await CommentAsync(post, content ?? "");
+
+            var finalContent = content ?? "";
+            if (string.IsNullOrEmpty(finalContent))
+            {
+                // 拉详情生成评论，失败兜底
+                string prompt;
+                try
+                {
+                    var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
+                    var parsed = detailResp.Ok ? QzoneParser.ParseFeeds(new List<object?> { detailResp.Data }) : new List<QzonePost>();
+                    prompt = parsed.Count > 0
+                        ? $"根据以下说说内容，生成一条简洁评论（0-15字）：\n{parsed[0].Text}"
+                        : "为这条说说生成一条简洁评论（0-15字）";
+                }
+                catch { prompt = "为这条说说生成一条简洁评论（0-15字）"; }
+                finalContent = await CallLlmAsync(prompt, "");
+                if (string.IsNullOrEmpty(finalContent)) finalContent = "赞一个！";
+            }
+
+            var result = await CommentAsync(post, finalContent);
             if (Configuration.LikeWhenComment && !result.Contains("未重复提交"))
             {
-                await Task.Delay(TimeSpan.FromSeconds(Random.Shared.NextDouble() * Configuration.LikeDelayJitter + Configuration.LikeDelayMin));
-                var likeResp = await _api!.LikeAsync(post, post.CreateTime);
-                if (likeResp.Ok) result += "，已同时点赞";
+                await AutoLikeAfterCommentAsync(post);
+                result += "（已尝试顺带点赞）";
             }
             interactor.Poke(result);
         }
@@ -1608,7 +2130,7 @@ public class QzoneModule(
                 return;
             }
             var fullPost = parsed[0];
-            var matches = fullPost.Comments.Where(c => c.Tid.ToString() == commentId).ToList();
+            var matches = fullPost.Comments.Where(c => c.Tid.ToString() == commentId || c.CommentId == commentId).ToList();
             if (!string.IsNullOrEmpty(commentUin))
                 matches = matches.Where(c => c.Uin.ToString() == commentUin).ToList();
             if (matches.Count == 0)
@@ -1642,7 +2164,7 @@ public class QzoneModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("查看自己QQ空间最近访客和访客统计。返回最近访客明细、来源、隐身/黄钻状态，以及今日和最近30天访客数。")]
+    [Description("查看自己QQ空间最近访客和访客统计。返回最近访客明细、来源、隐身/黄钻状态，以及今日和最近30天访客数。仅支持查看自己的空间。")]
     public async Task QzoneVisitors()
     {
         try
@@ -1722,7 +2244,7 @@ public class QzoneModule(
             var desc = await DescribeImageUrlAsync(url);
             if (string.IsNullOrEmpty(desc))
             {
-                interactor.Poke("图片识别失败（识图模型不可用或缓存未命中）");
+                interactor.Poke("图片识别失败（下载失败或识图模型不可用，链接可能已过期）");
                 return;
             }
             interactor.Poke($"第{index}张图片内容（共{fullPost.Images.Count}张）：{desc}");
@@ -1750,24 +2272,28 @@ public class QzoneModule(
                 interactor.Poke("无法确定当前会话，请直接使用images参数传图片URL");
                 return;
             }
-            if (!_imageRegistry.TryGetValue(sid, out var registry) || registry.Count == 0)
+            List<ImageEntry> entries;
+            lock (_imageRegistry)
             {
-                // 尝试从历史消息拉取
-                try
+                if (!_imageRegistry.TryGetValue(sid, out var registry) || registry.Count == 0)
                 {
-                    var (type, id) = ParseSessionId(sid);
-                    if (!string.IsNullOrEmpty(id))
-                        await FetchHistoryMessagesAsync(type, id, 20);
+                    // 尝试从历史消息拉取
+                    try
+                    {
+                        var (type, id) = ParseSessionId(sid);
+                        if (!string.IsNullOrEmpty(id))
+                            FetchHistoryMessagesAsync(type, id, 20).Wait(5000);
+                    }
+                    catch { }
+                    registry = _imageRegistry.GetValueOrDefault(sid) ?? new();
                 }
-                catch { }
-                registry = _imageRegistry.GetValueOrDefault(sid) ?? new();
+                entries = registry.TakeLast(Configuration.ImageManifestCount).ToList();
             }
-            if (registry.Count == 0)
+            if (entries.Count == 0)
             {
                 interactor.Poke("当前会话暂无近期图片，可改用images参数传图片URL或本地路径");
                 return;
             }
-            var entries = registry.TakeLast(Configuration.ImageManifestCount).ToList();
             var lines = new List<string>();
             for (int i = 0; i < entries.Count; i++)
             {
@@ -1780,7 +2306,7 @@ public class QzoneModule(
                 }
                 var timeStr = DateTimeOffset.FromUnixTimeSeconds(entry.Time).LocalDateTime.ToString("MM-dd HH:mm");
                 var sender = string.IsNullOrEmpty(entry.Sender) ? "未知" : entry.Sender;
-                lines.Add($"{i + 1}. [{timeStr} {sender}] {desc}");
+                lines.Add($"{i + 1}. [{timeStr} {sender}] {QzoneImagePolicy.CandidateLabel(desc)}");
             }
             interactor.Poke("[近期图片] 本会话最近出现的图片及内容描述，调用 qzone_publish 发说说时可用 image_indices 参数引用序号配图：\n" + string.Join("\n", lines));
         }
@@ -1794,38 +2320,23 @@ public class QzoneModule(
     {
         var result = new List<string>();
         var sid = GetCurrentSessionId();
-        if (string.IsNullOrEmpty(sid) || !_imageRegistry.TryGetValue(sid, out var registry))
-            return result;
-        var entries = registry.TakeLast(Configuration.ImageManifestCount).ToList();
+        if (string.IsNullOrEmpty(sid)) return result;
+        List<ImageEntry> entries;
+        lock (_imageRegistry)
+        {
+            if (!_imageRegistry.TryGetValue(sid, out var registry)) return result;
+            entries = registry.TakeLast(Configuration.ImageManifestCount).ToList();
+        }
         foreach (var part in imageIndices.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (!int.TryParse(part, out var idx)) continue;
             if (idx < 1 || idx > entries.Count) continue;
             var url = entries[idx - 1].Url;
-            if (!string.IsNullOrEmpty(url) && !result.Contains(url))
-                result.Add(url);
+            if (string.IsNullOrEmpty(url) || result.Contains(url)) continue;
+            result.Add(url);
         }
+        await Task.CompletedTask;
         return result;
-    }
-
-    private string? GetCurrentSessionId()
-    {
-        try
-        {
-            foreach (var content in ChatBot.ChatHistory.Reverse())
-            {
-                if (content.Role != AuthorRole.User) continue;
-                var text = content.Content ?? "";
-                if (text.StartsWith("[来自系统的杂项消息推送]") || text.StartsWith("[消息来源(")) continue;
-                var m = Regex.Match(text, @"\[群聊消息\((\d+)");
-                if (m.Success) return $"qq:gm:{m.Groups[1].Value}";
-                m = Regex.Match(text, @"\[私聊消息\((\d+)\)\]");
-                if (m.Success) return $"qq:dm:{m.Groups[1].Value}";
-                return null;
-            }
-        }
-        catch { }
-        return null;
     }
 
     private static (string Type, string Id) ParseSessionId(string sid)
