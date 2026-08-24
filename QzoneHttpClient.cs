@@ -100,8 +100,11 @@ public class QzoneHttpClient : IDisposable
             foreach (var (k, v) in headers)
                 req.Headers.TryAddWithoutValidation(k, v);
         }
-        foreach (var (k, v) in ctx.Cookies())
-            req.Headers.TryAddWithoutValidation("Cookie", $"{k}={v}");
+        // Cookie 必须合并为单个 header 用 "; " 连接（对齐 Kira/aiohttp 与浏览器行为）：
+        // 逐条发多个 Cookie header 时，.NET 会用 ", " 拼接或只生效第一条，导致 skey/p_skey 丢失引发鉴权失败
+        var cookies = ctx.Cookies();
+        if (cookies.Count > 0)
+            req.Headers.TryAddWithoutValidation("Cookie", string.Join("; ", cookies.Select(kv => $"{kv.Key}={kv.Value}")));
         if (form != null && form.Count > 0)
             req.Content = new FormUrlEncodedContent(form);
 

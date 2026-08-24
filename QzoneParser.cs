@@ -64,8 +64,32 @@ public static class QzoneParser
         }
         catch (JsonException)
         {
-            return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
+            // QZone 部分接口（尤其 format=fs 的 H5 路径）返回非标准 JSON：单引号字符串、无引号键、尾随逗号。
+            // Kira 用 json5 容忍这些；这里做一次宽松化预处理后重试（对齐 json5 行为）。
+            try
+            {
+                var doc = JsonDocument.Parse(ToLenientJson(jsonStr));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                    return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
+                return JsonToDict(doc.RootElement);
+            }
+            catch (JsonException)
+            {
+                return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
+            }
         }
+    }
+
+    /// <summary>非标准 JSON 宽松化：无引号键补引号、单引号转双引号、去尾随逗号（对齐 Kira 的 json5 解析）。</summary>
+    private static string ToLenientJson(string s)
+    {
+        // 单引号字符串 → 双引号（先处理，避免后续键名规则误伤）
+        s = Regex.Replace(s, @"'((?:[^'\\]|\\.)*)'", m => "\"" + m.Groups[1].Value.Replace("\"", "\\\"") + "\"");
+        // 无引号键名补引号：{key: 或 ,key:
+        s = Regex.Replace(s, @"([\{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", "$1\"$2\":");
+        // 尾随逗号：,} 或 ,]
+        s = Regex.Replace(s, @",\s*([}\]])", "$1");
+        return s;
     }
 
     private static Dictionary<string, object?> JsonToDict(JsonElement el)
@@ -469,7 +493,7 @@ public static class QzoneParser
                 var handler = new HttpClientHandler { SslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13 };
                 if (InsecureSslProvider?.Invoke() == true)
                     handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-                using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+                using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) }; // 对齐 Kira download_file 的 60s
                 http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
                 // 前几次带 qzone Referer，最后一次不带（兼容外部 CDN）
                 if (attempt < maxRetries - 1)
