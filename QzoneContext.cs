@@ -41,7 +41,8 @@ public class QzoneContext
         ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
         ["referer"] = $"https://user.qzone.qq.com/{Uin}",
         ["origin"] = "https://user.qzone.qq.com",
-        ["Host"] = "user.qzone.qq.com",
         ["Connection"] = "keep-alive",
+        // 注意：不设置 Host——由 HttpClient 按请求 URL 自动设置。
+        // 若固定为 user.qzone.qq.com，h5/up 等域名的请求会带错误 Host 导致路由失败。
     };
 }

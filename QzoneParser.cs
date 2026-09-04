@@ -55,20 +55,84 @@ public static class QzoneParser
 
         jsonStr = jsonStr.Replace("undefined", "null").Trim();
 
-        // 直接走宽松解析（对齐 Kira 的 json5 行为）：QZone 大量接口（尤其 H5 format=fs）
-        // 返回非标准 JSON。宽松化用引号状态机实现，只在双引号字符串外做转换，
-        // 对标准 JSON 与正文中的撇号（如 "I'm"）完全无副作用。
+        // 三级容错（对齐 Kira 的 json5 行为）：
+        // 1) 标准解析；2) 宽松化（单引号/无引号键/尾随逗号，引号状态机只在双引号字符串外转换，
+        //    对标准 JSON 与正文中的撇号如 "I'm" 完全无副作用）；3) HTML 感知修复——
+        //    feeds3_html_more 等接口的 html 字段内嵌 HTML 时，属性双引号常未转义，
+        //    破坏整个 JSON 结构，先修复字符串内未转义引号再走宽松化。
         try
         {
-            var doc = JsonDocument.Parse(ToLenientJson(jsonStr));
+            var doc = JsonDocument.Parse(jsonStr);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
                 return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
             return JsonToDict(doc.RootElement);
         }
         catch (JsonException)
         {
-            return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
+            try
+            {
+                var doc = JsonDocument.Parse(ToLenientJson(jsonStr));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                    return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
+                return JsonToDict(doc.RootElement);
+            }
+            catch (JsonException)
+            {
+                try
+                {
+                    var doc = JsonDocument.Parse(ToLenientJson(RepairHtmlQuotes(jsonStr)));
+                    if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                        return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
+                    return JsonToDict(doc.RootElement);
+                }
+                catch (JsonException)
+                {
+                    return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// 修复双引号字符串内未转义的双引号（QQ空间 feeds3_html_more 的 html 字段内嵌 HTML 时常见）。
+    /// 启发式：字符串内遇到 '"' 且前一个字符不是 '\'，若其后（跨空白）是 JSON 结构字符
+    /// （, } ] : 或文本结尾）则视为字符串结束，否则视为 HTML 属性引号，转义为 \"。
+    /// 对标准 JSON 零副作用（合法字符串内的引号必然已转义，先被 \\ 分支消费）。
+    /// </summary>
+    private static string RepairHtmlQuotes(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length + 32);
+        bool inString = false;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inString)
+            {
+                if (c == '\\' && i + 1 < s.Length)
+                {
+                    sb.Append(c).Append(s[++i]); // 保留转义对
+                    continue;
+                }
+                if (c == '"')
+                {
+                    int j = i + 1;
+                    while (j < s.Length && char.IsWhiteSpace(s[j])) j++;
+                    if (j >= s.Length || s[j] == ',' || s[j] == '}' || s[j] == ']' || s[j] == ':')
+                    {
+                        inString = false;
+                        sb.Append(c);
+                        continue;
+                    }
+                    sb.Append('\\').Append(c); // 字符串内未转义引号（HTML 属性），转义
+                    continue;
+                }
+                sb.Append(c);
+                continue;
+            }
+            if (c == '"') { inString = true; sb.Append(c); continue; }
+            sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -183,6 +247,35 @@ public static class QzoneParser
         return (picbo, richval);
     }
 
+    /// <summary>
+    /// 解析说说详情（兼容三种返回结构）：
+    /// 1) 顶层即说说字段（content/commentlist 等，h5 msgdetail_v6 常见）
+    /// 2) msglist: [{...}]（与 msglist_v6 同构）
+    /// 3) data: {...} 嵌套（data 内再含 msglist 或直接是说说字段）
+    /// 解析不出有效说说时返回空列表（不抛异常）。
+    /// </summary>
+    public static List<QzonePost> ParseDetail(Dictionary<string, object?> raw)
+    {
+        if (raw == null || raw.Count == 0) return new();
+        // 结构2：msglist 数组
+        if (raw.GetValueOrDefault("msglist") is List<object?> msgList && msgList.Count > 0)
+            return ParseFeeds(msgList);
+        // 结构3：data 嵌套
+        if (raw.GetValueOrDefault("data") is Dictionary<string, object?> dataDict)
+        {
+            if (dataDict.GetValueOrDefault("msglist") is List<object?> innerList && innerList.Count > 0)
+                return ParseFeeds(innerList);
+            var innerPosts = ParseFeeds(new List<object?> { dataDict });
+            if (innerPosts.Count > 0 && !string.IsNullOrEmpty(innerPosts[0].Tid) && innerPosts[0].Tid != "0")
+                return innerPosts;
+        }
+        // 结构1：顶层即说说
+        var topPosts = ParseFeeds(new List<object?> { raw });
+        if (topPosts.Count > 0 && !string.IsNullOrEmpty(topPosts[0].Tid) && topPosts[0].Tid != "0")
+            return topPosts;
+        return new();
+    }
+
     /// <summary>解析说说列表</summary>
     public static List<QzonePost> ParseFeeds(List<object?> msgList)
     {
@@ -244,7 +337,7 @@ public static class QzoneParser
                 likeKey = likeInfo.GetValueOrDefault("curlikekey")?.ToString() ?? likeInfo.GetValueOrDefault("orglikekey")?.ToString() ?? "";
             }
             var likedFlag = msg.GetValueOrDefault("isliked") ?? msg.GetValueOrDefault("isLiked") ?? msg.GetValueOrDefault("liked") ?? msg.GetValueOrDefault("is_liked");
-            isLiked = likedFlag is 1 or true or "1";
+            isLiked = likedFlag is 1L or 1 or true or "1";
 
             var tid = msg.GetValueOrDefault("tid")?.ToString() ?? "0";
             var post = new QzonePost
@@ -342,12 +435,15 @@ public static class QzoneParser
             var name = v.GetValueOrDefault("name")?.ToString();
             var visitor = SafeCell(string.IsNullOrEmpty(name) ? "匿名" : name, 16);
             var srcVal = v.GetValueOrDefault("src");
-            var srcKey = srcVal is int i ? i : -1;
+            // JsonToValue 对数字返回 long（装箱），需同时兼容 long/int
+            var srcKey = srcVal is long l ? (int)l : srcVal is int i ? i : -1;
             var src = SafeCell(srcMap.GetValueOrDefault(srcKey, $"未知({srcKey})"), 12);
             var statusParts = new List<string>();
-            if (v.GetValueOrDefault("yellow") is int yellow && yellow > 0)
-                statusParts.Add($"LV{yellow}");
-            if (v.GetValueOrDefault("is_hide_visit") is true)
+            if (v.GetValueOrDefault("yellow") is long yellowL && yellowL > 0)
+                statusParts.Add($"LV{yellowL}");
+            else if (v.GetValueOrDefault("yellow") is int yellowI && yellowI > 0)
+                statusParts.Add($"LV{yellowI}");
+            if (v.GetValueOrDefault("is_hide_visit") is true or 1L or 1)
                 statusParts.Add("隐身");
             var status = SafeCell(string.Join(" / ", statusParts), 12);
             var remark = "-";

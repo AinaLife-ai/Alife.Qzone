@@ -27,7 +27,10 @@ public class ApiResponse
         msgKeys ??= new[] { "message", "msg" };
         int code = -1;
         if (raw.TryGetValue(codeKey, out var codeVal))
-            code = Convert.ToInt32(codeVal);
+        {
+            try { code = Convert.ToInt32(codeVal); }
+            catch { code = -1; } // 非数字 code（异常响应）按失败处理，不抛异常
+        }
 
         string? message = null;
         foreach (var k in msgKeys)

@@ -752,7 +752,7 @@ public class QzoneModule(
                     return null;
                 }
                 // 私聊：源 tag 即发送者
-                var mp = Regex.Match(text, @"\[私聊消息\((\d+)\)\]");
+                var mp = Regex.Match(text, @"\[私聊消息\((\d+)(?:,[^)\]]*)?\)\]");
                 if (mp.Success) return mp.Groups[1].Value;
                 return null;
             }
@@ -1245,7 +1245,7 @@ public class QzoneModule(
             {
                 var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
                 if (!detailResp.Ok) continue;
-                var parsedPosts = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                var parsedPosts = QzoneParser.ParseDetail(detailResp.Data);
                 if (parsedPosts.Count == 0) continue;
                 var fullPost = parsedPosts[0];
 
@@ -1527,7 +1527,7 @@ public class QzoneModule(
             var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
             if (detailResp.Ok)
             {
-                var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                var parsed = QzoneParser.ParseDetail(detailResp.Data);
                 if (parsed.Count > 0)
                 {
                     var expected = Regex.Replace(content ?? "", @"\s+", "");
@@ -1578,7 +1578,7 @@ public class QzoneModule(
             var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
             if (detailResp.Ok)
             {
-                var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                var parsed = QzoneParser.ParseDetail(detailResp.Data);
                 if (parsed.Count > 0)
                 {
                     if (parsed[0].IsLiked)
@@ -1815,7 +1815,7 @@ public class QzoneModule(
                     var detailResp = await _api!.GetDetailAsync(p.Uin, p.Tid);
                     if (detailResp.Ok)
                     {
-                        var detailPosts = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                        var detailPosts = QzoneParser.ParseDetail(detailResp.Data);
                         if (detailPosts.Count > 0 && detailPosts[0].Comments.Count > 0)
                             p.Comments = detailPosts[0].Comments;
                     }
@@ -1968,7 +1968,7 @@ public class QzoneModule(
                 var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
                 if (detailResp.Ok)
                 {
-                    var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                    var parsed = QzoneParser.ParseDetail(detailResp.Data);
                     if (parsed.Count > 0)
                     {
                         if (parsed[0].CreateTime > 0) post.CreateTime = parsed[0].CreateTime;
@@ -2036,7 +2036,7 @@ public class QzoneModule(
                 try
                 {
                     var detailResp = await _api!.GetDetailAsync(post.Uin, post.Tid);
-                    var parsed = detailResp.Ok ? QzoneParser.ParseFeeds(new List<object?> { detailResp.Data }) : new List<QzonePost>();
+                    var parsed = detailResp.Ok ? QzoneParser.ParseDetail(detailResp.Data) : new List<QzonePost>();
                     prompt = parsed.Count > 0
                         ? $"根据以下说说内容，生成一条简洁评论（0-15字）：\n{parsed[0].Text}"
                         : "为这条说说生成一条简洁评论（0-15字）";
@@ -2110,7 +2110,7 @@ public class QzoneModule(
                 var detailResp = await _api!.GetDetailAsync(long.Parse(targetId), NormalizeTid(tid));
                 if (detailResp.Ok)
                 {
-                    var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+                    var parsed = QzoneParser.ParseDetail(detailResp.Data);
                     if (parsed.Count > 0)
                     {
                         var matched = MatchComment(parsed[0].Comments, commentId, commentUin ?? "");
@@ -2166,7 +2166,7 @@ public class QzoneModule(
                 interactor.Poke("获取说说详情失败，无法获取评论者信息");
                 return;
             }
-            var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+            var parsed = QzoneParser.ParseDetail(detailResp.Data);
             if (parsed.Count == 0)
             {
                 interactor.Poke("解析说说详情失败");
@@ -2266,7 +2266,7 @@ public class QzoneModule(
                 interactor.Poke($"获取说说详情失败: {detailResp.Message}");
                 return;
             }
-            var parsed = QzoneParser.ParseFeeds(new List<object?> { detailResp.Data });
+            var parsed = QzoneParser.ParseDetail(detailResp.Data);
             if (parsed.Count == 0)
             {
                 interactor.Poke("解析说说详情失败");
@@ -2374,8 +2374,13 @@ public class QzoneModule(
         {
             if (!int.TryParse(part, out var idx)) continue;
             if (idx < 1 || idx > entries.Count) continue;
-            var url = entries[idx - 1].Url;
+            var entry = entries[idx - 1];
+            var url = entry.Url;
             if (string.IsNullOrEmpty(url) || result.Contains(url)) continue;
+            // 历史 URL 的 rkey 有效期约 1 小时，过期后下载必 400；
+            // 先用 get_msg 按 message_id 续命换新签名 URL，失败再退回原 URL（对齐 Kira）。
+            if (!string.IsNullOrEmpty(entry.MsgId) && await TryRefreshImageUrlAsync(entry))
+                url = entry.Url ?? url;
             result.Add(url);
         }
         await Task.CompletedTask;

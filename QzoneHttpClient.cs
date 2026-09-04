@@ -147,11 +147,21 @@ public class QzoneHttpClient : IDisposable
                 timeoutSeconds, retry + 1, emptyRetry, emptyRetryLimit, ct);
         }
 
-        // 403 且无业务码 → 包装为权限不足
-        if ((int)resp.StatusCode == 403 && parsed.GetValueOrDefault("code") is null or -1)
+        // 403 且无业务码 → 包装为权限不足（code 可能是 long/int/string，统一转数值比较）
+        if ((int)resp.StatusCode == 403)
         {
-            parsed["code"] = 403L;
-            parsed["message"] = "权限不足";
+            var codeVal = parsed.GetValueOrDefault("code");
+            bool noBizCode = codeVal == null;
+            if (!noBizCode)
+            {
+                try { noBizCode = Convert.ToInt64(codeVal) == -1; }
+                catch { noBizCode = true; }
+            }
+            if (noBizCode)
+            {
+                parsed["code"] = 403L;
+                parsed["message"] = "权限不足";
+            }
         }
 
         return parsed;
