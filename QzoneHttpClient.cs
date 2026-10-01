@@ -31,6 +31,10 @@ public class QzoneHttpClient : IDisposable
     /// <summary>登录失效回调：返回 true 表示已刷新凭证可重试。由模块注入。</summary>
     public Func<Task<bool>>? OnAuthExpired { get; set; }
 
+    // 解析失败诊断日志限流（R1）：同一 URL+类型 60s 内只打一次
+    private readonly object _diagLock = new();
+    private readonly Dictionary<string, DateTime> _diagLoggedAt = new();
+
     /// <param name="ctxProvider">每次请求取最新上下文（Cookie 原地刷新后自动生效）。</param>
     public QzoneHttpClient(int timeoutSeconds, ILogger logger, Func<QzoneContext> ctxProvider,
         Func<bool>? insecureSslProvider = null)
@@ -110,20 +114,25 @@ public class QzoneHttpClient : IDisposable
 
         using var resp = await _http.SendAsync(req, cts.Token);
         var text = await resp.Content.ReadAsStringAsync(cts.Token);
-        var parsed = QzoneParser.ParseResponse(text);
+        var parsed = QzoneParser.ParseResponse(text, out var diag);
 
-        // 服务端偶发空响应（QZone 常见抽风）：独立重试额度，递增退避
-        if (parsed.GetValueOrDefault("message")?.ToString() == QzoneParser.MsgEmptyResponse && emptyRetry < emptyRetryLimit)
+        // R1：解析失败时输出可排查的诊断（含正文片段），同一 URL+类型 60s 内只打一次
+        if (diag.Kind != QzoneParser.BodyKind.Json)
+            LogParseIssue(resp, url, diag);
+
+        // R2：空响应 / 被截断 / 乱码 一律按“服务端抽风”重试（此前只重试空响应）
+        if (QzoneParser.IsRetryableParseFailure(diag) && emptyRetry < emptyRetryLimit)
         {
             var wait = emptyRetry + 1;
-            _logger.LogWarning("响应内容为空，{Wait}秒后重试({N}/{Limit}): {Url}", wait, emptyRetry + 1, emptyRetryLimit, url);
+            _logger.LogWarning("空间响应异常（{Kind}，{Diag}），{Wait}秒后重试({N}/{Limit}): {Url}",
+                diag.Kind, diag.Describe(), wait, emptyRetry + 1, emptyRetryLimit, Redact(url));
             await Task.Delay(TimeSpan.FromSeconds(wait), ct);
             return await RequestInternal(method, url, query, form, headers,
                 timeoutSeconds, retry, emptyRetry + 1, emptyRetryLimit, ct);
         }
 
-        // 登录失效检测 → 刷新 Cookie 自救
-        if (IsAuthFailure((int)resp.StatusCode, parsed))
+        // 登录失效检测（含 R5：返回登录页的归类）→ 刷新 Cookie 自救
+        if (diag.LooksLikeLogin || IsAuthFailure((int)resp.StatusCode, parsed))
         {
             if (retry >= 4)
                 throw new Exception("登录失效，Cookie 刷新后重试仍失败");
@@ -165,6 +174,39 @@ public class QzoneHttpClient : IDisposable
         }
 
         return parsed;
+    }
+
+    /// <summary>去除 URL 里的敏感参数（g_tk/skey 等），仅用于日志</summary>
+    internal static string Redact(string url)
+    {
+        try
+        {
+            return System.Text.RegularExpressions.Regex.Replace(
+                url, @"(g_tk|skey|p_skey|uin)=[^&]*", "$1=***",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+        catch { return url; }
+    }
+
+    /// <summary>解析失败诊断日志（R1）：带正文片段，限流</summary>
+    private void LogParseIssue(HttpResponseMessage resp, string url, QzoneParser.ParseDiagnostics diag)
+    {
+        try
+        {
+            string key = $"{url}|{diag.Kind}|{diag.LooksLikeLogin}|{diag.LooksLikeRisk}";
+            lock (_diagLock)
+            {
+                if (_diagLoggedAt.TryGetValue(key, out var last) && (DateTime.Now - last).TotalSeconds < 60) return;
+                if (_diagLoggedAt.Count > 64) _diagLoggedAt.Clear();
+                _diagLoggedAt[key] = DateTime.Now;
+            }
+            _logger.LogWarning(
+                "空间响应无法解析：{Diag} | HTTP {Status} | Content-Type={CT} | URL={Url}\n正文前300字：{Snippet}",
+                diag.Describe(), (int)resp.StatusCode,
+                resp.Content.Headers.ContentType?.ToString() ?? "(无)",
+                Redact(url), diag.Snippet);
+        }
+        catch { }
     }
 
     private static bool IsAuthFailure(int status, Dictionary<string, object?> parsed)

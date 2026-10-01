@@ -32,12 +32,109 @@ public static class QzoneParser
         return s;
     }
 
+    // ==================== 响应体诊断（R1）====================
+
+    /// <summary>响应体类型判定（供重试/归类/日志使用）</summary>
+    public enum BodyKind
+    {
+        Json,        // 正常 JSON/JSONP
+        Empty,       // 空响应（服务端抽风，可重试）
+        Truncated,   // 被截断的不完整 JSON（可重试）
+        Html,        // 返回的是网页（风控/验证/错误页）
+        Garbage      // 其他无法识别的正文
+    }
+
+    /// <summary>解析过程诊断信息（R1：解析失败也能拿到可排查的线索）</summary>
+    public sealed class ParseDiagnostics
+    {
+        public BodyKind Kind = BodyKind.Json;
+        public int Length;
+        public string Snippet = "";
+        public string Attempts = "";
+        /// <summary>疑似登录失效（需要刷新 Cookie）</summary>
+        public bool LooksLikeLogin;
+        /// <summary>疑似风控/需要验证（刷新 Cookie 无用，应等待）</summary>
+        public bool LooksLikeRisk;
+        public string Describe() =>
+            $"kind={Kind} len={Length} attempts=[{Attempts}]" +
+            (LooksLikeLogin ? " login-required" : "") + (LooksLikeRisk ? " risk-page" : "");
+    }
+
+    /// <summary>可重试的解析失败（服务端抽风类）</summary>
+    public static bool IsRetryableParseFailure(ParseDiagnostics d) =>
+        d.Kind is BodyKind.Empty or BodyKind.Truncated or BodyKind.Garbage;
+
+    private static readonly Regex LoginHintRegex = new(
+        @"please\s*login|need\s*login|请先登录|需要登录|未登录|登录后|重新登录|登录失败|login_?state",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex RiskHintRegex = new(
+        @"验证码|captcha|verify|安全验证|异常访问|系统繁忙|系统错误|访问过于频繁|操作频繁|请稍后再试|forbidden",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>取正文片段用于日志（转义换行，限长）</summary>
+    public static string SnippetOf(string? text, int max = 300)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        var s = text.Length <= max ? text : text[..max] + "…";
+        return s.Replace("\r", "").Replace("\n", "\\n").Replace("\t", " ");
+    }
+
+    /// <summary>正文归类（在解析失败后调用）</summary>
+    private static BodyKind ClassifyBody(string raw, string candidate)
+    {
+        var head = raw.Length > 2000 ? raw[..2000] : raw;
+        bool looksHtml = head.TrimStart().StartsWith("<") ||
+                         Regex.IsMatch(head, @"<(html|head|body|div|script|meta)\b", RegexOptions.IgnoreCase);
+        if (looksHtml) return BodyKind.Html;
+        // 括号/引号不平衡 ⇒ 截断
+        if (!Balanced(candidate)) return BodyKind.Truncated;
+        return BodyKind.Garbage;
+    }
+
+    /// <summary>粗略平衡检查（只在失败后调用，用于区分"截断"与"真乱码"）</summary>
+    private static bool Balanced(string s)
+    {
+        int depth = 0;
+        bool inStr = false;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inStr)
+            {
+                if (c == '\\' && i + 1 < s.Length) { i++; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+        }
+        return depth == 0 && !inStr;
+    }
+
+    // ==================== 解析（R1–R5）====================
+
     /// <summary>解析JSON/JSONP/非标准JSON响应</summary>
     public static Dictionary<string, object?> ParseResponse(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            return new() { ["code"] = -1, ["message"] = MsgEmptyResponse };
+        => ParseResponse(text, out _);
 
+    /// <summary>
+    /// 解析响应（带诊断输出）。
+    /// 尝试顺序（R3 排列组合，任一成功即返回）：
+    ///   strict → lenient → repair → lenient(repair) → repair(lenient) → 截断补全
+    /// 全失败后再做字段级抢救（R4：只解析 msglist / data.html），最后归类（R5）。
+    /// </summary>
+    public static Dictionary<string, object?> ParseResponse(string text, out ParseDiagnostics diag)
+    {
+        diag = new ParseDiagnostics { Length = text?.Length ?? 0, Snippet = SnippetOf(text) };
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            diag.Kind = BodyKind.Empty;
+            return new() { ["code"] = -1, ["message"] = MsgEmptyResponse };
+        }
+
+        // JSONP 回调剥离 / 取首尾花括号
         string jsonStr;
         var m = Regex.Match(text, @"callback\s*\(\s*([^{]*(\{.*\})[^)]*)\s*\)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
         if (m.Success)
@@ -49,48 +146,226 @@ public static class QzoneParser
             int start = text.IndexOf('{');
             int end = text.LastIndexOf('}');
             if (start == -1 || end == -1 || end < start)
-                return new() { ["code"] = -1, ["message"] = "响应内容格式异常" };
+            {
+                diag.Kind = ClassifyBody(text, text);
+                diag.LooksLikeLogin = LoginHintRegex.IsMatch(text);
+                diag.LooksLikeRisk = RiskHintRegex.IsMatch(text);
+                return new() { ["code"] = -1, ["message"] = DescribeFailure(diag) };
+            }
             jsonStr = text.Substring(start, end - start + 1);
         }
 
         jsonStr = jsonStr.Replace("undefined", "null").Trim();
 
-        // 三级容错（对齐 Kira 的 json5 行为）：
-        // 1) 标准解析；2) 宽松化（单引号/无引号键/尾随逗号，引号状态机只在双引号字符串外转换，
-        //    对标准 JSON 与正文中的撇号如 "I'm" 完全无副作用）；3) HTML 感知修复——
-        //    feeds3_html_more 等接口的 html 字段内嵌 HTML 时，属性双引号常未转义，
-        //    破坏整个 JSON 结构，先修复字符串内未转义引号再走宽松化。
+        // R3：多种宽松化排列组合，逐个尝试
+        var attempts = new (string Name, Func<string> Build)[]
+        {
+            ("strict", () => jsonStr),
+            ("lenient", () => ToLenientJson(jsonStr)),
+            ("repair", () => RepairHtmlQuotes(jsonStr)),
+            ("lenient+repair", () => ToLenientJson(RepairHtmlQuotes(jsonStr))),
+            ("repair+lenient", () => RepairHtmlQuotes(ToLenientJson(jsonStr))),
+        };
+        foreach (var (name, build) in attempts)
+        {
+            if (TryParseObject(build(), out var dict))
+            {
+                diag.Attempts = name;
+                return dict!;
+            }
+        }
+        // 截断补全：正文被切掉尾巴时补上闭合符号再试
+        if (TryCompleteTruncated(RepairHtmlQuotes(jsonStr), out var completed) && TryParseObject(completed, out var dict2))
+        {
+            diag.Attempts = "truncation-completed";
+            diag.Kind = BodyKind.Truncated;
+            return dict2!;
+        }
+
+        // R4：字段级抢救——整文档废了也要把我们要的那段捞出来
+        if (TrySalvageMsgList(jsonStr, out var salvaged))
+        {
+            diag.Attempts = "salvage:msglist";
+            return salvaged!;
+        }
+        if (TrySalvageDataHtml(jsonStr, out var salvaged2))
+        {
+            diag.Attempts = "salvage:data.html";
+            return salvaged2!;
+        }
+
+        // R5：归类 + 可读错误
+        diag.Kind = ClassifyBody(text, jsonStr);
+        diag.LooksLikeLogin = LoginHintRegex.IsMatch(text);
+        diag.LooksLikeRisk = RiskHintRegex.IsMatch(text);
+        return new() { ["code"] = -1, ["message"] = DescribeFailure(diag) };
+    }
+
+    /// <summary>失败原因的可读文案（R5：不再只有一句"JSON 解析失败"）</summary>
+    private static string DescribeFailure(ParseDiagnostics d)
+    {
+        if (d.LooksLikeLogin) return "响应提示需要登录（Cookie 可能已失效）";
+        if (d.Kind == BodyKind.Html)
+            return d.LooksLikeRisk
+                ? "空间返回的是网页而非数据（疑似风控/需要验证，请稍后再试）"
+                : "空间返回的是网页而非数据（可能是异常页，请稍后再试）";
+        if (d.Kind == BodyKind.Truncated) return "响应不完整（可能被截断，请稍后再试）";
+        if (d.Kind == BodyKind.Garbage) return "响应格式异常（非 JSON 数据）";
+        return "JSON 解析失败";
+    }
+
+    private static bool TryParseObject(string candidate, out Dictionary<string, object?>? dict)
+    {
+        dict = null;
+        if (string.IsNullOrWhiteSpace(candidate)) return false;
         try
         {
-            var doc = JsonDocument.Parse(jsonStr);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
-            return JsonToDict(doc.RootElement);
+            using var doc = JsonDocument.Parse(candidate);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+            dict = JsonToDict(doc.RootElement);
+            return true;
         }
-        catch (JsonException)
+        catch (JsonException) { return false; }
+        catch (ArgumentException) { return false; }
+    }
+
+    /// <summary>截断补全：补齐未闭合的字符串/数组/对象（最多补 64 个字符）</summary>
+    private static bool TryCompleteTruncated(string s, out string completed)
+    {
+        completed = "";
+        var sb = new System.Text.StringBuilder(s);
+        var stack = new List<char>();
+        bool inStr = false;
+        for (int i = 0; i < s.Length; i++)
         {
-            try
+            char c = s[i];
+            if (inStr)
             {
-                var doc = JsonDocument.Parse(ToLenientJson(jsonStr));
-                if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                    return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
-                return JsonToDict(doc.RootElement);
+                if (c == '\\' && i + 1 < s.Length) { i++; continue; }
+                if (c == '"') inStr = false;
+                continue;
             }
-            catch (JsonException)
+            if (c == '"') inStr = true;
+            else if (c == '{' || c == '[') stack.Add(c);
+            else if (c == '}' || c == ']')
             {
-                try
-                {
-                    var doc = JsonDocument.Parse(ToLenientJson(RepairHtmlQuotes(jsonStr)));
-                    if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                        return new() { ["code"] = -1, ["message"] = "JSON 根节点不是对象" };
-                    return JsonToDict(doc.RootElement);
-                }
-                catch (JsonException)
-                {
-                    return new() { ["code"] = -1, ["message"] = "JSON 解析失败" };
-                }
+                if (stack.Count > 0) stack.RemoveAt(stack.Count - 1);
             }
         }
+        int added = 0;
+        if (inStr) { sb.Append('"'); added++; }
+        for (int k = stack.Count - 1; k >= 0 && added < 64; k--)
+        {
+            sb.Append(stack[k] == '{' ? '}' : ']');
+            added++;
+        }
+        if (added == 0) return false;
+        completed = sb.ToString();
+        return true;
+    }
+
+    /// <summary>R4：从损坏文档里把 "msglist":[...] 这个平衡数组整段抠出来单独解析</summary>
+    public static bool TrySalvageMsgList(string jsonStr, out Dictionary<string, object?>? result)
+    {
+        result = null;
+        int key = jsonStr.IndexOf("\"msglist\"", StringComparison.Ordinal);
+        if (key < 0) return false;
+        int colon = jsonStr.IndexOf(':', key);
+        if (colon < 0) return false;
+        int arrStart = jsonStr.IndexOf('[', colon);
+        if (arrStart < 0) return false;
+        string? arr = ExtractBalanced(jsonStr, arrStart, '[', ']');
+        if (arr == null) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(arr);
+            var list = JsonToValue(doc.RootElement);
+            if (list is List<object?> msgList)
+            {
+                result = new() { ["code"] = 0, ["message"] = "salvaged", ["msglist"] = msgList };
+                return true;
+            }
+        }
+        catch (JsonException) { }
+        return false;
+    }
+
+    /// <summary>R4：从损坏文档里把 data.html / 各条 feed 的 html 字段抠出来（recent-feeds 备用路径）</summary>
+    public static bool TrySalvageDataHtml(string jsonStr, out Dictionary<string, object?>? result)
+    {
+        result = null;
+        if (jsonStr.IndexOf("\"html\"", StringComparison.Ordinal) < 0) return false;
+        var feeds = new List<object?>();
+        int idx = 0;
+        while (true)
+        {
+            int key = jsonStr.IndexOf("\"html\"", idx, StringComparison.Ordinal);
+            if (key < 0) break;
+            idx = key + 6;
+            int colon = jsonStr.IndexOf(':', key);
+            if (colon < 0) break;
+            int q = jsonStr.IndexOf('"', colon + 1);
+            if (q < 0) break;
+            string? raw = ExtractRawString(jsonStr, q);
+            if (raw == null) continue;
+            if (raw.TrimStart().StartsWith("<")) feeds.Add(new Dictionary<string, object?> { ["html"] = raw });
+        }
+        if (feeds.Count == 0) return false;
+        result = new()
+        {
+            ["code"] = 0,
+            ["message"] = "salvaged-html",
+            ["data"] = new Dictionary<string, object?> { ["data"] = feeds }
+        };
+        return true;
+    }
+
+    /// <summary>从 start（指向 '[' 或 '{'）抠出平衡的一段</summary>
+    private static string? ExtractBalanced(string s, int start, char open, char close)
+    {
+        int depth = 0;
+        bool inStr = false;
+        for (int i = start; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inStr)
+            {
+                if (c == '\\' && i + 1 < s.Length) { i++; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == open) depth++;
+            else if (c == close)
+            {
+                depth--;
+                if (depth == 0) return s.Substring(start, i - start + 1);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>读取一个（可能被内嵌未转义引号破坏的）字符串值：
+    /// 以「后随结构字符（, } ]）或另一个引号键」为结束判据，尽可能把整段 HTML 取回来</summary>
+    private static string? ExtractRawString(string s, int quoteStart)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = quoteStart + 1; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '\\' && i + 1 < s.Length) { sb.Append(c).Append(s[i + 1]); i++; continue; }
+            if (c == '"')
+            {
+                // 后随结构字符 ⇒ 认为字符串结束
+                int k = i + 1;
+                while (k < s.Length && char.IsWhiteSpace(s[k])) k++;
+                if (k >= s.Length || s[k] == ',' || s[k] == '}' || s[k] == ']') return sb.ToString();
+                sb.Append(c); // 否则是内嵌引号，保留
+                continue;
+            }
+            sb.Append(c);
+        }
+        return sb.Length > 0 ? sb.ToString() : null;
     }
 
     /// <summary>
