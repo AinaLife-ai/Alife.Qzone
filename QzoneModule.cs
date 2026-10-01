@@ -709,7 +709,7 @@ public class QzoneModule(
         if (_myUin == 0)
             throw new Exception("Cookie 中未解析到有效 QQ 号（uin），会话不可用");
         _initFailed = false;
-        UpdateHandlerExplanation();
+        PublishOwnIdentityPrompt();
         logger.LogInformation("QQ空间会话就绪 uin={Uin}", _myUin);
     }
 
@@ -720,7 +720,7 @@ public class QzoneModule(
         try
         {
             _myUin = _session.GetCtx().Uin;
-            if (_myUin != 0) UpdateHandlerExplanation();
+            if (_myUin != 0) PublishOwnIdentityPrompt();
         }
         catch { /* 会话尚未就绪：等下一次调用 */ }
     }
@@ -1886,16 +1886,15 @@ public class QzoneModule(
 
     // ==================== 生命周期 ====================
 
-    private XmlHandler? _qzoneHandler;
-
     protected override Task OnAwake()
     {
-        _qzoneHandler = new(this) {
+        // 注意：XmlHandler 的 Description/Explanation 是 init-only，只能在初始化器里设置
+        XmlHandler xmlHandler = new(this) {
             Description = "提供QQ空间说说发布、查看、点赞、评论、回复、删除、访客统计、图片识图、定时任务等功能",
             Explanation = "发布/查看/评论/回复/点赞/删除/访客/识图/图片清单/定时任务；" +
                           "评论与回复请先 QzoneView 拿到 ID 与 UIN；不要重复评论同一条说说，不要评论自己的说说。"
         };
-        functionCaller.RegisterHandler(_qzoneHandler, DocumentMode.Implicit, DestroyCancellationToken);
+        functionCaller.RegisterHandler(xmlHandler, DocumentMode.Implicit, DestroyCancellationToken);
 
         foreach (var id in Configuration.MasterIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             _masterIds.Add(id);
@@ -1927,17 +1926,21 @@ public class QzoneModule(
         return Task.CompletedTask;
     }
 
-    private bool _explanationUpdated;
+    private bool _identityPromptPublished;
 
-    /// <summary>P4：把「你自己的QQ号」告诉 AI——否则它只能靠昵称猜哪个是自己（昵称可改可重名）</summary>
-    private void UpdateHandlerExplanation()
+    /// <summary>
+    /// 把「你自己的QQ号」告诉 AI——否则它只能靠昵称猜哪个是自己（昵称可改可重名）。
+    /// 走 Interactor.Prompt（模块功能说明注入点）；**不能**改 XmlHandler.Explanation ——
+    /// 框架里它是 `{ get; init; }`，只能在对象初始值设定项里赋值。
+    /// </summary>
+    private void PublishOwnIdentityPrompt()
     {
-        if (_explanationUpdated || _qzoneHandler == null || _myUin == 0) return;
-        _explanationUpdated = true;
-        _qzoneHandler.Explanation =
-            $"你自己的QQ号是 {_myUin}：QzoneView 结果里带「（我）」的说说/评论就是你自己，" +
+        if (_identityPromptPublished || _myUin == 0) return;
+        _identityPromptPublished = true;
+        interactor.Prompt(
+            $"你自己的QQ号是 {_myUin}：QzoneView 结果里带「（我）」的说说/评论就是你自己；" +
             "不要评论或回复自己，也不要对同一条说说重复评论。评论/回复前先用 QzoneView 取到 ID 与 UIN；" +
-            "配图优先用 imageIndices 引用[近期图片]清单序号，或 images 传图片URL/本地路径。";
+            "配图优先用 imageIndices 引用[近期图片]清单序号，或 images 传图片URL/本地路径。");
     }
 
     protected override async Task OnStart()

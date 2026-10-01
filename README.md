@@ -124,6 +124,22 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 
 ## 更新日志
 
+### 4.5.3
+
+- **修复插件加载失败（编译错误，紧急）**：
+  `QzoneModule.cs: error CS8852: 只能在对象初始值设定项中…分配 init-only 属性 "XmlHandler.Explanation"`
+  - 原因：4.5.0 为了把「你自己的QQ号」告诉 AI，在会话就绪后**后赋值**了 `XmlHandler.Explanation`；
+    而框架里它是 **`{ get; init; }`**（只能在对象初始值设定项里设置）⇒ 插件根本无法编译加载
+  - 修复：改用 Alife 的惯用做法 **`Interactor.Prompt(...)`** 注入该说明（模块功能说明注入点），
+    不再触碰 `XmlHandler` 的 init-only 属性
+  - 影响面：仅此一处；4.5.0/4.5.1/4.5.2 在此版本之前**都无法加载**，请务必升级到 4.5.3
+- **测试台保真度加固**（防止同类问题再次溜过）：
+  - 桩里的 `XmlHandler` 改为与官方**完全一致**（`Name` 只读、`Description`/`Explanation` 为 `init-only`）
+    —— 以后任何对 init-only 属性的后赋值，**本地测试台就会编译失败**
+  - 新增两条**结构判据**测试：扫描源码断言不存在 `handler.Explanation =` / `_qzoneHandler.Explanation =` 这类写法
+  - 全量 diff 扫描确认：新增代码里对属性的赋值**只发生在本插件自有类型**上
+- 自检：真值表 **62/62 通过**，桩编译 0 error / 0 warning
+
 ### 4.5.2
 
 **回到 Kira 原版提示词 + 按 Alife 实际修正识图策略**（4.5.0/4.5.1 有两处"自创"改得不合适，本版收回）
