@@ -25,8 +25,14 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 
 ## 近期图片清单：两条硬规则（对齐 Kira v1.4.8）
 
-1. **只走免费路径**：清单**只列已经有描述的图**。拿不到描述 ⇒ 这张图不进清单：不列表、不下载、更不识图。
-   识图工作在**图片出现的那一刻**（收到消息、回拉历史时）就后台开始；**注入钩子纯只读**（零 await、零 IO、零后台任务），结构上不可能阻塞回复。
+1. **只列已经认识的图**：清单**只列已经有描述的图**。拿不到描述 ⇒ 这张图不进清单：不列表、不下载、更不识图。
+   **注入钩子纯只读**（零 await、零 IO、零后台任务），结构上不可能阻塞回复。
+
+   > ⚠️ **Alife 与 Kira 的差异（重要）**：Kira 那边是**框架先自动描述图片**（hash + 描述写进共享缓存），
+   > 钩子只读现成结果，所以是"免费"的；**Alife 完全没有这套机制**——QChat 只把图片渲染成 `[图片: 路径或URL]`。
+   > 因此 Alife 的等价"免费路径"是：**AI 直接用消息文本里的路径调 `QzonePublish(images=…)` 配图（零 VLM 调用）**。
+   > 需要"按内容挑图"时才识图，且只在两种**显式**情况下发生：
+   > ① AI 主动调 `QzoneImageManifest`（受 `ImageDescOnManifestRequest` 约束）；② 打开可选的「图片到达即识图」（默认关）。
 2. **按需注入**：`ImageManifestInjectMode` 默认 `on_demand` —— **只在插件自己的定时发布任务那一轮注入**。
    `always` = 旧行为（**每轮注入，会让清单永久挂在上下文里**，Kira v1.4.8 已修，本移植版曾复辟，现已修正）；`off` = 不注入（仍可用工具主动获取）。
 
@@ -82,14 +88,15 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 | AutoReplyEnabled | 自动回复总开关 |
 | MaxCommentsPerCycle / MaxRepliesPerCycle | 每轮最大评论/回复数 |
 | CommentWindowDays | **评论时间窗（默认 7 天，0=不限）**：只评论窗口内发布的说说，防挖坟 |
-| TaskInjectCandidates | **指令模式注入候选清单**（排除已评论/超窗/黑名单），避免 AI 满世界找导致重复工作 |
+| TaskInjectCandidates | 【默认关，与 Kira 一致】开启后指令模式会附上过滤好的候选清单；关=完全按 Kira 原文让 AI 自行查找 |
 | LegacyCommentUseWhitelist | **好友动态接口不可用时用白名单兜底**（逐个拉取该接口稳定的好友说说） |
 | QzoneBlacklist / QzoneWhitelist | 黑白名单QQ，逗号分隔 |
 | BlackoutSchedules | 定时任务黑名单时间段，如 `00:00-06:00`（支持跨天，只管定时任务） |
 | ImageManifestEnabled / ImageManifestCount | 近期图片清单总开关 / 数量 |
 | **ImageManifestInjectMode** | **on_demand（默认，仅发布任务那一轮）/ always（每轮，旧行为）/ off** |
 | **ImageDescMaxChars** | 清单里每条描述的最大字数（默认 80，0=不截断） |
-| **ImageDescOnManifestRequest** | AI 主动要清单时是否顺意识图（关=严格只列已识别） |
+| **ImageDescOnManifestRequest** | 【默认开】AI 主动要清单时是否顺意识图（关=严格只列已识别；**这是 Alife 下清单能有内容的主要来源**） |
+| **ImageDescPrefetchOnArrival** | 【默认关】图片一到就后台识图（清单更快有内容，但每张图都烧一次 VLM；默认策略是「AI 主动才识图」） |
 | QzoneImageDescEnabled / QzoneImageDescOwn | 图片识图开关/允许识自己图 |
 | AutoCommentImageDesc | 后台自动评论前先识别对方配图 |
 | AutoPublishGroupId / AutoPublishUserId | 后台直接生成模式的消息来源群号/QQ号 |
@@ -116,6 +123,23 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 - `QzoneImageManifest`：获取近期图片清单（只列已识别的图）
 
 ## 更新日志
+
+### 4.5.2
+
+**回到 Kira 原版提示词 + 按 Alife 实际修正识图策略**（4.5.0/4.5.1 有两处"自创"改得不合适，本版收回）
+
+- **提示词回归 Kira 原文**：删除 4.5.0 自加的「已评论过的说说不要再评论；同一轮内不要对同一作者连评多条。」与「尽量避免与最近已发布的内容雷同。」
+  —— Kira 原版提示词已在实机验证有效，自创加句没有依据；**只保留 Alife 必须的名字适配**（`QzoneReplyComment` / `targetId` / `imageIndices` / `QzonePublish`）
+- **候选清单注入改为默认关**（`TaskInjectCandidates`）：默认行为与 Kira 完全一致（AI 自行查找）；
+  需要时可在配置里打开
+- **识图策略按 Alife 实际修正**：Kira 的"免费路径"依赖**框架先自动描述图片**，而 **Alife 没有这套机制**
+  （QChat 只渲染 `[图片: 路径或URL]`）⇒
+  - 默认策略改为「**AI 主动才识图**」：聊天图片直接用消息里的路径传 `images` 配图（**零 VLM 调用**）
+  - 新增 `ImageDescPrefetchOnArrival`（**默认关**）：4.5.0 的"图片到达即后台识图"改为可选，
+    因为它并非 Kira 做法、且会给每张图都花一次 VLM
+  - 清单仍有内容的来源：AI 主动调 `QzoneImageManifest` 时按需识图（`ImageDescOnManifestRequest`，默认开）
+- 自检：真值表 **59/59 通过**（新增 G 组 9 项：指令文本与 Kira 逐字比对、不含自创加句、
+  候选注入与到达即识图默认关、默认配置下 QQ 图片**零 VLM 调用**）
 
 ### 4.5.1
 

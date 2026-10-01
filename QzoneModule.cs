@@ -120,6 +120,11 @@ public class QzoneConfig
     [Description("清单里每条描述的最大字数（0=不截断）。识图模型对截图类图片会输出几百字，展示层截断可省 token（写进缓存的仍是完整描述）")]
     public int ImageDescMaxChars { get; set; } = 80;
 
+    [DisplayName("图片到达即识图")]
+    [Description("【默认关】开启后图片一到就后台识图，清单能更快有内容，但等于给每张图都花一次 VLM 调用。" +
+        "Alife 没有 Kira 那种框架级免费描述来源，默认策略是「AI 主动才识图」：聊天图片直接用消息里的 [图片: 路径] 传 images 配图（零调用）")]
+    public bool ImageDescPrefetchOnArrival { get; set; } = false;
+
     [DisplayName("清单请求时识图")]
     [Description("AI 主动调用 QzoneImageManifest 时，对尚未识别的图顺意识图（受本次清单上限约束）；关=只列已识别的图（严格对齐 Kira「拿不到描述就不进清单」）")]
     public bool ImageDescOnManifestRequest { get; set; } = true;
@@ -193,8 +198,9 @@ public class QzoneConfig
     public int CommentWindowDays { get; set; } = 7;
 
     [DisplayName("任务指令注入候选")]
-    [Description("指令模式下，先把过滤好的候选说说清单注入指令（排除已评论/超时窗/黑名单），让AI在确定候选里选，避免重复工作；关=沿用Kira原文（AI自行查找）")]
-    public bool TaskInjectCandidates { get; set; } = true;
+    [Description("【默认关，与 Kira 原版一致】开启后，指令模式会把过滤好的候选清单（排除已评论/超时窗/黑名单）附在指令后。" +
+        "关=完全按 Kira 原文让 AI 自行查找（推荐：Kira 原版提示词已在实机验证有效）")]
+    public bool TaskInjectCandidates { get; set; } = false;
 
     [DisplayName("自动评论白名单兜底")]
     [Description("好友动态接口（feeds3_html_more）不可用时，改用稳定的单目标接口逐个拉取白名单QQ的说说继续评论；白名单为空时该项无效")]
@@ -959,9 +965,16 @@ public class QzoneModule(
         }
     }
 
-    /// <summary>图片出现的那一刻就后台识图（硬规则 1 的"识图工作前移"）</summary>
+    /// <summary>
+    /// 可选：图片到达即后台识图（默认关）。
+    /// ⚠️ Alife 没有 Kira 那种「框架先描述、钩子只读缓存」的免费描述来源：若在到达时就识图，
+    /// 等于给每张图都花一次 VLM（既非 Kira 做法也不经济）。默认策略是「AI 主动才识图」：
+    /// 聊天图片用消息文本里的 [图片: 路径] 直接传 images 配图（零调用）；
+    /// 需要按内容挑图时由 AI 调 QzoneImageManifest（受 ImageDescOnManifestRequest 约束）或框架 VisionService。
+    /// </summary>
     private void ScheduleDescribeIfNeeded(ImageEntry entry)
     {
+        if (!Configuration.ImageDescPrefetchOnArrival) return;
         if (!Configuration.QzoneImageDescEnabled) return;
         if (!string.IsNullOrEmpty(entry.Desc) || entry.DescPending) return;
         if (string.IsNullOrEmpty(entry.Url)) return;
@@ -1146,8 +1159,7 @@ public class QzoneModule(
             {
                 var instruction = "【定时任务】请根据最近聊天发布一条说说，自然一点，不要提及这是定时任务。"
                     + QzoneImagePolicy.BuildInstruction(targetImageCount, Configuration.AutoPublishImageMax)
-                    + "配图时用 imageIndices 选择，也可用 images 传聊天记录里见过的图片URL或本地路径。"
-                    + "尽量避免与最近已发布的内容雷同。";
+                    + "配图时用 imageIndices 选择，也可用 images 传聊天记录里见过的图片URL或本地路径。";
                 // 硬规则 2：只有「插件自己的定时发布任务」这一轮才注入清单
                 ArmManifestInjection();
                 await SendTaskInstructionAsync(instruction, true);
@@ -1171,8 +1183,8 @@ public class QzoneModule(
                 || Configuration.TaskPrivateIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0;
             if (hasTargets)
             {
+                // 与 Kira 原版逐字一致（Alife 侧不做任何加句）；候选清单默认关闭，需要时再开
                 var instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点和简洁（0-15字内）。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。";
-                instruction += "已评论过的说说不要再评论；同一轮内不要对同一作者连评多条。";
                 if (Configuration.TaskInjectCandidates)
                     instruction += "\n" + await BuildCandidateBlockAsync();
                 await SendTaskInstructionAsync(instruction, false);
@@ -1395,10 +1407,9 @@ public class QzoneModule(
             var posts = await GetFeedsAsync(null, 20);
             var candidates = FilterCommentCandidates(posts);
             if (candidates.Count == 0)
-                return "（本轮候选为空：最近的好友说说都已评论过、或超出时间窗、或被名单过滤，本轮请直接跳过，不要自己去找。）";
-            return "本轮候选（已按「" + Math.Max(0, Configuration.CommentWindowDays) + "天内 / 未评论过 / 非黑名单」过滤，"
-                + "选好后用 QzoneComment 传 targetId=作者UIN、tid=ID 评论）：\n" + BuildCandidateLines(candidates, 8)
-                + "\n请只在这些候选里选，不要自己去遍历好友空间。";
+                return "（本轮候选为空：好友说说均已评论过、或超出时间窗、或被名单过滤。）";
+            return "可选候选（已按「" + Math.Max(0, Configuration.CommentWindowDays) + "天内 / 未评论过 / 非黑名单」过滤；"
+                + "用 QzoneComment 传 targetId=作者UIN、tid=ID 评论）：\n" + BuildCandidateLines(candidates, 8);
         }
         catch (Exception e)
         {
