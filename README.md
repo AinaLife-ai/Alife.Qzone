@@ -117,6 +117,16 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 
 ## 更新日志
 
+### 4.5.1
+
+- **修净「工具名/参数名」的最后一处错配**（4.5.0 的同类修复遗漏了一个文件）：
+  - 发布任务指令正文里仍是 `image_indices 传入 qzone_publish` ⇒ 改为 **`imageIndices` 传入 `QzonePublish`**
+    （这句直接进 AI 上下文，名字错会让它调用不存在的工具/参数）
+  - `QzoneView` 的配图提示里 `QzoneDescribeImage(target_id=…)` ⇒ 改为 **`targetId`**
+  - 目标非法时报错文案 `target_id 需要是QQ号` ⇒ 改为 **`targetId`**
+- 全仓扫描确认：除"移植自 Kira"的注释外，**再无 snake_case 工具名/参数名残留**
+- 自检：真值表 50/50 通过
+
 ### 4.5.0
 
 **问题①：自动评论每轮报 `获取说说失败: JSON 解析失败`（评论本身可用）**

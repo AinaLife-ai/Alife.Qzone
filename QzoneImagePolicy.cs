@@ -23,7 +23,7 @@ public static class QzoneImagePolicy
         if (target == 0)
             return $"本次随机配图目标为0：由你根据内容自主决定是否配图，可选0至{maximum}张。";
         return $"本次随机配图目标为{target}张：优先从[近期图片]清单选择恰好{target}张，" +
-               "并用image_indices传入 qzone_publish；只有可用候选不足时才允许少图或纯文字发布。";
+               "并用 imageIndices 传入 QzonePublish；只有可用候选不足时才允许少图或纯文字发布。";
     }
 
     /// <summary>按序去重并剔除空项</summary>

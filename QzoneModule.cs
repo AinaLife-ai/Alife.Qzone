@@ -1774,7 +1774,7 @@ public class QzoneModule(
         {
             // D：此前是 long.Parse，AI 传昵称/链接会抛 FormatException，报错对用户毫无意义
             if (!long.TryParse(targetId.Trim(), out var targetUin) || targetUin <= 0)
-                throw new Exception($"target_id 需要是QQ号（纯数字），收到的是「{targetId}」");
+                throw new Exception($"targetId 需要是QQ号（纯数字），收到的是「{targetId}」");
             resp = await _api!.GetMsgListAsync(targetUin, num);
         }
         else
@@ -2118,7 +2118,7 @@ public class QzoneModule(
                 {
                     var isOwn = _myUin != 0 && p.Uin == _myUin;
                     if (Configuration.QzoneImageDescEnabled && (!isOwn || Configuration.QzoneImageDescOwn))
-                        line += $"\n配图x{p.Images.Count}（调用 QzoneDescribeImage(target_id='{p.Uin}', tid='{p.Tid}', index=第几张) 可查看图片内容）";
+                        line += $"\n配图x{p.Images.Count}（调用 QzoneDescribeImage(targetId='{p.Uin}', tid='{p.Tid}', index=第几张) 可查看图片内容）";
                     else
                         line += $"\n配图x{p.Images.Count}";
                 }
