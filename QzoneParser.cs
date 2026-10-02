@@ -55,9 +55,12 @@ public static class QzoneParser
         public bool LooksLikeLogin;
         /// <summary>疑似风控/需要验证（刷新 Cookie 无用，应等待）</summary>
         public bool LooksLikeRisk;
+        /// <summary>严格解析失败的精确位置线索（R1 加强：定位到行 + 该行内容）</summary>
+        public string SyntaxHint = "";
         public string Describe() =>
             $"kind={Kind} len={Length} attempts=[{Attempts}]" +
-            (LooksLikeLogin ? " login-required" : "") + (LooksLikeRisk ? " risk-page" : "");
+            (LooksLikeLogin ? " login-required" : "") + (LooksLikeRisk ? " risk-page" : "") +
+            (SyntaxHint.Length > 0 ? " | " + SyntaxHint : "");
     }
 
     /// <summary>可重试的解析失败（服务端抽风类）</summary>
@@ -89,6 +92,103 @@ public static class QzoneParser
         // 括号/引号不平衡 ⇒ 截断
         if (!Balanced(candidate)) return BodyKind.Truncated;
         return BodyKind.Garbage;
+    }
+
+    /// <summary>
+    /// JSON 感知清洗（4.5.4 新增，最后一档兜底）：单遍扫描，修正两类真实故障——
+    /// ① **字符串值内的裸控制字符**（服务端把 HTML 直接塞进 JSON 时，里面的换行/制表没转义 ⇒ 全文档非法）
+    /// ② **字符串值内未转义的引号**（HTML 属性引号；仅当其后不是结构字符 /,/}/]/: 时才判为内容并转义）
+    /// 对合法 JSON 零副作用（合法字符串里的引号必然已转义）。
+    /// </summary>
+    public static string SanitizeJson(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length + 64);
+        bool inStr = false;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (!inStr)
+            {
+                if (c == '"') inStr = true;
+                sb.Append(c);
+                continue;
+            }
+            // —— 字符串内部 ——
+            if (c == '\\' && i + 1 < s.Length) { sb.Append(c).Append(s[i + 1]); i++; continue; }
+            if (c == '"')
+            {
+                int j = i + 1;
+                while (j < s.Length && char.IsWhiteSpace(s[j])) j++;
+                if (j >= s.Length || s[j] == ',' || s[j] == '}' || s[j] == ']' || s[j] == ':')
+                {
+                    inStr = false;
+                    sb.Append(c);
+                }
+                else
+                {
+                    sb.Append("\\\"");   // 内嵌引号（HTML 属性等）→ 转义
+                }
+                continue;
+            }
+            if (c < 0x20) { sb.Append("\\u").Append(((int)c).ToString("x4")); continue; }   // 裸控制字符 → \uXXXX
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>严格解析失败的精确线索：行号 + 列号 + 报错那一行的内容（截断到 160 字）</summary>
+    private static string BuildSyntaxHint(string jsonStr)
+    {
+        try
+        {
+            JsonDocument.Parse(jsonStr);
+            return "";
+        }
+        catch (JsonException ex)
+        {
+            long line = (ex.LineNumber ?? 0) + 1;
+            long col = (ex.BytePositionInLine ?? 0) + 1;
+            string badLine = "";
+            try
+            {
+                var lines = jsonStr.Split('\n');
+                if (lines.Length > 0)
+                {
+                    int li = (int)Math.Clamp(line - 1, 0, lines.Length - 1);
+                    badLine = lines[li];
+                    if (badLine.Length > 160) badLine = badLine[..160] + "…";
+                }
+            }
+            catch { }
+            return $"首次语法错误 line {line} col {col}（{ex.Message}）该行：{badLine}";
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// 汇报响应结构（解析成功但取不到数据时用）：定位"接口结构变了"这类问题，而不是静默返回 0 条。
+    /// </summary>
+    public static string DescribeShape(Dictionary<string, object?> data, int maxKeys = 12)
+    {
+        try
+        {
+            var top = data.Keys.Take(maxKeys).ToList();
+            string detail = "";
+            if (data.GetValueOrDefault("data") is Dictionary<string, object?> d)
+            {
+                var dk = d.Keys.Take(maxKeys).ToList();
+                string inner = d.GetValueOrDefault("data") is List<object?> l
+                    ? $"list(len={l.Count})"
+                    : (d.ContainsKey("data") ? "非列表" : "无该键");
+                detail = $" | data.keys=[{string.Join(",", dk)}] | data.data={inner}" +
+                         $" | data.main={(d.ContainsKey("main") ? "有" : "无")}";
+            }
+            return $"top.keys=[{string.Join(",", top)}]{detail}";
+        }
+        catch { return "(结构描述失败)"; }
     }
 
     /// <summary>粗略平衡检查（只在失败后调用，用于区分"截断"与"真乱码"）</summary>
@@ -165,6 +265,8 @@ public static class QzoneParser
             ("repair", () => RepairHtmlQuotes(jsonStr)),
             ("lenient+repair", () => ToLenientJson(RepairHtmlQuotes(jsonStr))),
             ("repair+lenient", () => RepairHtmlQuotes(ToLenientJson(jsonStr))),
+            ("sanitize", () => SanitizeJson(jsonStr)),                      // ★ 4.5.4：裸控制字符 + 内嵌引号
+            ("sanitize+lenient", () => SanitizeJson(ToLenientJson(jsonStr))),
         };
         foreach (var (name, build) in attempts)
         {
@@ -175,24 +277,28 @@ public static class QzoneParser
             }
         }
         // 截断补全：正文被切掉尾巴时补上闭合符号再试
-        if (TryCompleteTruncated(RepairHtmlQuotes(jsonStr), out var completed) && TryParseObject(completed, out var dict2))
+        if (TryCompleteTruncated(SanitizeJson(jsonStr), out var completed) && TryParseObject(completed, out var dict2))
         {
             diag.Attempts = "truncation-completed";
             diag.Kind = BodyKind.Truncated;
             return dict2!;
         }
 
-        // R4：字段级抢救——整文档废了也要把我们要的那段捞出来
-        if (TrySalvageMsgList(jsonStr, out var salvaged))
+        // R4：字段级抢救——整文档废了也要把我们要的那段捞出来（先用清洗结果，引号才一致）
+        string sanitized = SanitizeJson(jsonStr);
+        if (TrySalvageMsgList(sanitized, out var salvaged))
         {
             diag.Attempts = "salvage:msglist";
             return salvaged!;
         }
-        if (TrySalvageDataHtml(jsonStr, out var salvaged2))
+        if (TrySalvageDataHtml(sanitized, out var salvaged2))
         {
             diag.Attempts = "salvage:data.html";
             return salvaged2!;
         }
+
+        // 记录严格解析的精确报错位置（只在全失败后跑一次，成功路径零开销）
+        diag.SyntaxHint = BuildSyntaxHint(jsonStr);
 
         // R5：归类 + 可读错误
         diag.Kind = ClassifyBody(text, jsonStr);

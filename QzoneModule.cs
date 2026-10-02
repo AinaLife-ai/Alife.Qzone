@@ -725,6 +725,20 @@ public class QzoneModule(
         catch { /* 会话尚未就绪：等下一次调用 */ }
     }
 
+    private DateTime _shapeWarnAt = DateTime.MinValue;
+
+    /// <summary>结构异常告警（限流 30 分钟一次）：解析成功但取不到数据时，把顶层结构打出来便于定位</summary>
+    private void WarnShapeOnce(string reason, Dictionary<string, object?> data)
+    {
+        try
+        {
+            if (DateTime.Now - _shapeWarnAt < TimeSpan.FromMinutes(30)) return;
+            _shapeWarnAt = DateTime.Now;
+            logger.LogWarning("{Reason}：{Shape}", reason, QzoneParser.DescribeShape(data));
+        }
+        catch { }
+    }
+
     private async Task ThrottleWriteAsync()
     {
         // 透明节流：只延迟不拦截，相邻写间隔 = 配置值 + 抖动
@@ -1797,6 +1811,8 @@ public class QzoneModule(
         {
             // 回退：feeds3_html_more 返回的 HTML 格式
             posts = QzoneParser.ParseRecentFeeds(resp.Data);
+            if (posts.Count == 0)
+                WarnShapeOnce("好友动态解析为 0 条（可能接口结构已变化）", resp.Data);
         }
         return posts.Take(num).ToList();
     }
