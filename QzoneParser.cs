@@ -261,12 +261,13 @@ public static class QzoneParser
         var attempts = new (string Name, Func<string> Build)[]
         {
             ("strict", () => jsonStr),
-            ("lenient", () => ToLenientJson(jsonStr)),
+            ("js-normalize", () => JsObjectToJson(jsonStr)),
             ("repair", () => RepairHtmlQuotes(jsonStr)),
-            ("lenient+repair", () => ToLenientJson(RepairHtmlQuotes(jsonStr))),
-            ("repair+lenient", () => RepairHtmlQuotes(ToLenientJson(jsonStr))),
+            ("js+repair", () => JsObjectToJson(RepairHtmlQuotes(jsonStr))),
+            ("repair+js", () => RepairHtmlQuotes(JsObjectToJson(jsonStr))),
             ("sanitize", () => SanitizeJson(jsonStr)),                      // ★ 4.5.4：裸控制字符 + 内嵌引号
-            ("sanitize+lenient", () => SanitizeJson(ToLenientJson(jsonStr))),
+            ("sanitize+js", () => SanitizeJson(JsObjectToJson(jsonStr))),
+            ("js+sanitize", () => JsObjectToJson(SanitizeJson(jsonStr))),
         };
         foreach (var (name, build) in attempts)
         {
@@ -291,14 +292,21 @@ public static class QzoneParser
             diag.Attempts = "salvage:msglist";
             return salvaged!;
         }
+        if (TrySalvageFeedsArray(sanitized, out var salvagedFeeds))
+        {
+            diag.Attempts = "salvage:feeds-array";
+            return salvagedFeeds!;
+        }
         if (TrySalvageDataHtml(sanitized, out var salvaged2))
         {
             diag.Attempts = "salvage:data.html";
             return salvaged2!;
         }
 
-        // 记录严格解析的精确报错位置（只在全失败后跑一次，成功路径零开销）
-        diag.SyntaxHint = BuildSyntaxHint(jsonStr);
+        // 精确报错位置：优先报告“规范化后”文档的错误（原始文档的问题可能早已被修好）
+        diag.SyntaxHint = BuildSyntaxHint(JsObjectToJson(jsonStr));
+        string rawHint = BuildSyntaxHint(jsonStr);
+        if (rawHint.Length > 0 && diag.SyntaxHint.Length == 0) diag.SyntaxHint = rawHint;
 
         // R5：归类 + 可读错误
         diag.Kind = ClassifyBody(text, jsonStr);
@@ -394,6 +402,55 @@ public static class QzoneParser
         }
         catch (JsonException) { }
         return false;
+    }
+
+    /// <summary>
+    /// R4 加强（4.5.5）：把 `data:[{...}]` 这串 feed 数组**整段抠出来**、规范化后单独解析
+    /// ⇒ 即使整文档含未知构造，好友动态仍可用（保住 uin/key/html 元数据，不做退化抢救）
+    /// </summary>
+    public static bool TrySalvageFeedsArray(string jsonStr, out Dictionary<string, object?>? result)
+    {
+        result = null;
+        foreach (string key in new[] { "\"data\"", "data" })
+        {
+            int from = 0;
+            while (true)
+            {
+                int at = jsonStr.IndexOf(key, from, StringComparison.Ordinal);
+                if (at < 0) break;
+                int colon = jsonStr.IndexOf(':', at + key.Length);
+                if (colon < 0) break;
+                int open = jsonStr.IndexOf('[', colon);
+                if (open < 0) break;
+                string? arr = ExtractBalanced(jsonStr, open, '[', ']');
+                if (arr != null && TryParseArray(JsObjectToJson(arr), out var list) && list != null && list.Count > 0)
+                {
+                    result = new()
+                    {
+                        ["code"] = 0,
+                        ["message"] = "salvaged-feeds",
+                        ["data"] = new Dictionary<string, object?> { ["data"] = list }
+                    };
+                    return true;
+                }
+                from = at + key.Length;
+            }
+        }
+        return false;
+    }
+
+    private static bool TryParseArray(string candidate, out List<object?>? list)
+    {
+        list = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(candidate);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return false;
+            list = JsonToValue(doc.RootElement) as List<object?>;
+            return list != null;
+        }
+        catch (JsonException) { return false; }
+        catch (ArgumentException) { return false; }
     }
 
     /// <summary>R4：从损坏文档里把 data.html / 各条 feed 的 html 字段抠出来（recent-feeds 备用路径）</summary>
@@ -517,71 +574,159 @@ public static class QzoneParser
     }
 
     /// <summary>
-    /// 非标准 JSON 宽松化（引号状态机版）：双引号字符串外才做转换——
-    /// 单引号字符串转双引号（内部双引号转义）、{key: / ,key: 无引号键补引号、去尾随逗号。
+    /// **JS 对象字面量 → 严格 JSON** 规范化器（4.5.5 重写，取代拼凑式宽松化）。
+    ///
+    /// 背景：`feeds3_html_more` 的 `data` 值是 **JavaScript 对象字面量**而非 JSON
+    /// （无引号键、单引号字符串、可能有注释/尾随逗号），字符串里常直接嵌 HTML（含裸换行、未转义属性引号）。
+    /// 本器是**字符级状态机**，输出保证为合法 JSON；比 json5 更宽（json5 不允许字符串内裸换行）。
     /// </summary>
-    private static string ToLenientJson(string s)
+    public static string JsObjectToJson(string s)
     {
-        var sb = new System.Text.StringBuilder(s.Length + 16);
-        bool inDouble = false;
-        for (int i = 0; i < s.Length; i++)
+        var sb = new System.Text.StringBuilder(s.Length + 64);
+        int i = 0;
+        while (i < s.Length)
         {
             char c = s[i];
-            if (inDouble)
+
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '/')
             {
-                sb.Append(c);
-                if (c == '\\' && i + 1 < s.Length) sb.Append(s[++i]); // 保留转义对
-                else if (c == '"') inDouble = false;
+                while (i < s.Length && s[i] != '\n') i++;
                 continue;
             }
-            if (c == '"') { inDouble = true; sb.Append(c); continue; }
-            if (c == '\'')
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
             {
-                // 单引号字符串 → 双引号（内部未转义双引号补转义；\' 还原为 '）
-                sb.Append('"');
-                for (i++; i < s.Length; i++)
-                {
-                    char sc = s[i];
-                    if (sc == '\\' && i + 1 < s.Length)
-                    {
-                        char nx = s[i + 1];
-                        if (nx == '\'') { sb.Append('\''); i++; continue; }
-                        sb.Append(sc); sb.Append(nx); i++; continue;
-                    }
-                    if (sc == '\'') break;
-                    if (sc == '"') sb.Append('\\');
-                    sb.Append(sc);
-                }
-                sb.Append('"');
+                i += 2;
+                while (i + 1 < s.Length && !(s[i] == '*' && s[i + 1] == '/')) i++;
+                i = Math.Min(s.Length, i + 2);
                 continue;
             }
-            if (c == '{' || c == ',')
+
+            if (c == '"' || c == '\'')
             {
-                // 向前看：{ 或 , 后是空白+标识符+冒号 → 无引号键，补引号
-                int j = i + 1;
-                while (j < s.Length && char.IsWhiteSpace(s[j])) j++;
-                int k = j;
-                while (k < s.Length && (char.IsLetterOrDigit(s[k]) || s[k] == '_')) k++;
-                int m = k;
-                while (m < s.Length && char.IsWhiteSpace(s[m])) m++;
-                if (k > j && m < s.Length && s[m] == ':')
+                i = ReadStringInto(s, i, sb);
+                continue;
+            }
+
+            if (char.IsLetter(c) || c == '_' || c == '$')
+            {
+                int st = i;
+                while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_' || s[i] == '$')) i++;
+                string word = s.Substring(st, i - st);
+                int k = i;
+                while (k < s.Length && char.IsWhiteSpace(s[k])) k++;
+                if (k < s.Length && s[k] == ':') sb.Append('"').Append(word).Append('"');
+                else if (word is "true" or "false" or "null") sb.Append(word);
+                else if (word is "undefined" or "NaN" or "Infinity") sb.Append("null");
+                else sb.Append('"').Append(word).Append('"');
+                continue;
+            }
+
+            if (char.IsDigit(c) || c == '+' || (c == '-' && i + 1 < s.Length && char.IsDigit(s[i + 1])) ||
+                (c == '.' && i + 1 < s.Length && char.IsDigit(s[i + 1])))
+            {
+                int st = i;
+                if (s[i] == '+') i++;
+                if (i + 1 < s.Length && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X'))
                 {
-                    sb.Append(c).Append(s, i + 1, j - i - 1);
-                    sb.Append('"').Append(s, j, k - j).Append('"');
-                    sb.Append(s, k, m - k).Append(':');
-                    i = m;
+                    i += 2;
+                    int hs = i;
+                    while (i < s.Length && Uri.IsHexDigit(s[i])) i++;
+                    long hv = 0;
+                    try { hv = Convert.ToInt64(s.Substring(hs, i - hs), 16); } catch { }
+                    sb.Append(hv);
                     continue;
                 }
-                // 去尾随逗号：, 后（跨空白）直接是 } 或 ]
-                if (c == ',' && j < s.Length && (s[j] == '}' || s[j] == ']'))
-                    continue; // 丢弃此逗号
-                sb.Append(c);
+                while (i < s.Length && (char.IsDigit(s[i]) || s[i] == '.' || s[i] == 'e' || s[i] == 'E' ||
+                       ((s[i] == '+' || s[i] == '-') && i > st && (s[i - 1] == 'e' || s[i - 1] == 'E')))) i++;
+                sb.Append(s, st, i - st);
                 continue;
             }
+
+            if (c == ',')
+            {
+                int k = i + 1;
+                while (k < s.Length && char.IsWhiteSpace(s[k])) k++;
+                if (k < s.Length && (s[k] == '}' || s[k] == ']')) { i++; continue; }
+                sb.Append(',');
+                i++;
+                continue;
+            }
+
             sb.Append(c);
+            i++;
         }
         return sb.ToString();
     }
+
+    /// <summary>读入一个字符串字面量并写出合法 JSON 字符串；返回下一个待处理下标</summary>
+    private static int ReadStringInto(string s, int start, System.Text.StringBuilder sb)
+    {
+        char quote = s[start];
+        bool single = quote == '\'';
+        sb.Append('"');
+        int i = start + 1;
+        while (i < s.Length)
+        {
+            char c = s[i];
+
+            if (c == '\\' && i + 1 < s.Length)
+            {
+                char nx = s[i + 1];
+                if (nx == 'n') { sb.Append("\\n"); i += 2; continue; }
+                if (nx == 'r') { sb.Append("\\r"); i += 2; continue; }
+                if (nx == 't') { sb.Append("\\t"); i += 2; continue; }
+                if (nx == 'b') { sb.Append("\\b"); i += 2; continue; }
+                if (nx == 'f') { sb.Append("\\f"); i += 2; continue; }
+                if (nx == '"') { sb.Append("\\\""); i += 2; continue; }
+                if (nx == '\\') { sb.Append("\\\\"); i += 2; continue; }
+                if (nx == '/') { sb.Append('/'); i += 2; continue; }
+                if (nx == '\'') { sb.Append("'"); i += 2; continue; }
+                if (nx == 'n') { i += 2; continue; }
+                if (nx == 'u' && i + 5 < s.Length)
+                {
+                    sb.Append('\\').Append('u').Append(s, i + 2, 4);
+                    i += 6;
+                    continue;
+                }
+                if (nx == 'x' && i + 3 < s.Length && Uri.IsHexDigit(s[i + 2]) && Uri.IsHexDigit(s[i + 3]))
+                {
+                    int code = Convert.ToInt32(s.Substring(i + 2, 2), 16);
+                    sb.Append("\\u").Append(code.ToString("x4"));
+                    i += 4;
+                    continue;
+                }
+                if (nx == '\n') { i += 2; continue; }      // 续行
+                sb.Append('\\').Append(nx);
+                i += 2;
+                continue;
+            }
+
+            if (c == quote)
+            {
+                if (!single)
+                {
+                    int k = i + 1;
+                    while (k < s.Length && char.IsWhiteSpace(s[k])) k++;
+                    bool terminator = k >= s.Length || s[k] == ',' || s[k] == '}' || s[k] == ']' || s[k] == ':';
+                    if (!terminator) { sb.Append("\\\""); i++; continue; }   // HTML 属性引号
+                }
+                sb.Append('"');
+                return i + 1;
+            }
+
+            if (c == '"' && single) { sb.Append("\\\""); i++; continue; }
+            if (c < 0x20) { sb.Append("\\u").Append(((int)c).ToString("x4")); i++; continue; }
+            if (c == '\n' || c == '\r') { i++; continue; }
+            sb.Append(c);
+            i++;
+        }
+        sb.Append('"');
+        return i;
+    }
+
+    public static string ToLenientJsonPublic(string s) => JsObjectToJson(s);
+
+    private static string ToLenientJson(string s) => JsObjectToJson(s);
 
     private static Dictionary<string, object?> JsonToDict(JsonElement el)
     {

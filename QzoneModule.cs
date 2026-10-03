@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Alife.Foundation;
 using Alife.Framework;
 using Alife.Function.AIModelUtility;
 using Alife.Function.FunctionCaller;
@@ -205,6 +206,11 @@ public class QzoneConfig
     [DisplayName("自动评论白名单兜底")]
     [Description("好友动态接口（feeds3_html_more）不可用时，改用稳定的单目标接口逐个拉取白名单QQ的说说继续评论；白名单为空时该项无效")]
     public bool LegacyCommentUseWhitelist { get; set; } = true;
+
+    [DisplayName("失败响应落盘")]
+    [Description("【排查用，默认关】好友动态接口响应无法解析时，把**原始正文**（截断 256KB）写入 " +
+        "PluginData/AinaLife.Qzone/last_bad_body.txt，便于把真实脏数据交给开发者一次性定位。排查完请关闭")]
+    public bool DiagnosticDumpRaw { get; set; } = false;
 
     [DisplayName("查看时拉取详情")]
     [Description("QzoneView 是否逐条拉取详情与点赞列表（更全但请求多：N条≈2N+次请求）；关=只看列表字段（省请求，防限流）")]
@@ -1934,6 +1940,23 @@ public class QzoneModule(
         _httpClient = new QzoneHttpClient(Configuration.Timeout, logger, () => _session.GetCtx(),
             insecureSslProvider: () => Configuration.AllowInsecureSsl);
         _httpClient.OnAuthExpired = () => RefreshCookieAsync(force: true);
+        // 排查用：解析失败时按配置把响应正文落盘（截断 256KB），供一次性定位真实脏数据
+        _httpClient.OnParseFailureDump = (url, body) =>
+        {
+            if (!Configuration.DiagnosticDumpRaw || string.IsNullOrEmpty(body)) return;
+            try
+            {
+                var dir = Path.Combine(AlifePath.StorageFolderPath, "PluginData", "AinaLife.Qzone");
+                Directory.CreateDirectory(dir);
+                var path = Path.Combine(dir, "last_bad_body.txt");
+                var text = body.Length > 262144 ? body[..262144] : body;
+                File.WriteAllText(path,
+                    $"[URL] {QzoneHttpClient.Redact(url)}\n[Len] {body.Length}\n[Time] {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n----\n{text}",
+                    Encoding.UTF8);
+                logger.LogWarning("响应正文已落盘（排查用，可关闭「失败响应落盘」）：{Path}", path);
+            }
+            catch (Exception e) { logger.LogDebug(e, "落盘失败响应正文失败"); }
+        };
         _api = new QzoneApi(_session, _httpClient);
 
         // 近期图片清单注入（PokeSend 过滤器，随 QQ 消息一并送达 AI）

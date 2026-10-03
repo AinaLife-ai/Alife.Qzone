@@ -35,6 +35,9 @@ public class QzoneHttpClient : IDisposable
     private readonly object _diagLock = new();
     private readonly Dictionary<string, DateTime> _diagLoggedAt = new();
 
+    /// <summary>解析失败时回吐正文（由模块按配置决定是否落盘；用于一次性定位真实脏数据）</summary>
+    public Action<string, string>? OnParseFailureDump { get; set; }
+
     /// <param name="ctxProvider">每次请求取最新上下文（Cookie 原地刷新后自动生效）。</param>
     public QzoneHttpClient(int timeoutSeconds, ILogger logger, Func<QzoneContext> ctxProvider,
         Func<bool>? insecureSslProvider = null)
@@ -118,7 +121,10 @@ public class QzoneHttpClient : IDisposable
 
         // R1：解析失败时输出可排查的诊断（含正文片段），同一 URL+类型 60s 内只打一次
         if (diag.Kind != QzoneParser.BodyKind.Json)
+        {
             LogParseIssue(resp, url, diag);
+            try { OnParseFailureDump?.Invoke(url, text); } catch { }
+        }
 
         // R2：空响应 / 被截断 / 乱码 一律按“服务端抽风”重试（此前只重试空响应）
         if (QzoneParser.IsRetryableParseFailure(diag) && emptyRetry < emptyRetryLimit)
