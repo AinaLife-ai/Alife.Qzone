@@ -24,7 +24,6 @@ public class QzoneApi
     private const string ListUrl = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6";
     private const string CommentUrl = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds";
     private const string CommentH5Url = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds";
-    private const string ZoneListUrl = "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more";
     private const string VisitorUrl = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more";
     private const string ReplyUrl = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds";
     private const string DeleteUrl = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6";
@@ -510,32 +509,6 @@ public class QzoneApi
             },
             headers: new() { ["Referer"] = $"{BaseUrl}/{Ctx.Uin}", ["Accept"] = "application/json, text/javascript, */*; q=0.01", ["X-Requested-With"] = "XMLHttpRequest" },
             emptyRetryLimit: 1,
-            ct: ct);
-        return ApiResponse.FromRaw(raw);
-    }
-
-    /// <summary>获取好友最近说说（feeds3_html_more，HTML解析）</summary>
-    public async Task<ApiResponse> GetRecentFeedsAsync(int page = 1, CancellationToken ct = default)
-    {
-        var raw = await _client.RequestAsync(HttpMethod.Get, ZoneListUrl,
-            query: new()
-            {
-                ["uin"] = Ctx.Uin.ToString(),
-                ["scope"] = "0",
-                ["view"] = "1",
-                ["filter"] = "all",
-                ["flag"] = "1",
-                ["applist"] = "all",
-                ["pagenum"] = page.ToString(),
-                ["aisortEndTime"] = "0",
-                ["aisortOffset"] = "0",
-                ["aisortBeginTime"] = "0",
-                ["begintime"] = "0",
-                ["format"] = "json",
-                ["g_tk"] = Ctx.Gtk2,
-                ["useutf8"] = "1",
-                ["outputhtmlfeed"] = "1",
-            },
             ct: ct);
         return ApiResponse.FromRaw(raw);
     }

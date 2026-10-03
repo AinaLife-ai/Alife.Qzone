@@ -19,8 +19,12 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 - **近期图片清单（按需注入）**：默认只在**插件自己的定时发布任务那一轮**注入；只列**已识别**的图；也可随时主动调用 `QzoneImageManifest` 获取（详见下节）
 - 图片链接过期自动续命（get_msg 换新签名 URL）
 - **定时任务**：自动发布/自动评论/自动回复（cron 或 interval+抖动，黑名单时间段，60s 防抖，misfire 容错，**任务互斥防并发重复**）
-  - 指令模式（推荐）：配了「任务群ID/任务私聊ID」时，由 AI 以完整人设执行，自带防重复/防复读/防挖坟/防重复工作的提示词引导
-  - 后台模式：未配任务目标时由插件直接生成并操作（**无 AI 参与、无提示词层引导**，仅代码层过滤；首次运行会打一条提示日志）
+  - **只有一种模式：AI 指令模式**（4.6.0 起）。插件把任务指令注入会话，由 AI 以完整人设/记忆执行，
+    自带 Kira 原文的防重复/防复读/防挖坟引导 ✓
+  - **「任务群ID / 任务私聊ID」= 指令锚点**（可选）：填了则指令带「当前场合」（发布任务用，与 Kira 一致）；
+    不填也照常执行（只是不带场合信息），并打一条配置建议
+  - ⚠️ **已删除"后台直接生成"模式**（4.6.0）：它依赖老端点 `feeds3_html_more`（返回 JS 对象字面量，是历次脏数据的来源）。
+    现在好友动态改走**稳定的单目标接口** `emotion_cgi_msglist_v6`（与评论同族），**结构性杜绝**那类问题
 - **Cookie 全自动获取**（四层机制 + 启动自愈，见下）
 
 ## 近期图片清单：两条硬规则（对齐 Kira v1.4.8）
@@ -86,10 +90,8 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 | Timeout | HTTP请求超时(秒)（Cookie 获取固定 5s 不受影响） |
 | AutoPublishSchedule / AutoCommentSchedule / AutoReplySchedule | 定时表达式：cron 5段 或 interval（如 `30m`、`2h/30m` 抖动） |
 | AutoReplyEnabled | 自动回复总开关 |
-| MaxCommentsPerCycle / MaxRepliesPerCycle | 每轮最大评论/回复数 |
 | CommentWindowDays | **评论时间窗（默认 7 天，0=不限）**：只评论窗口内发布的说说，防挖坟 |
 | TaskInjectCandidates | 【默认关，与 Kira 一致】开启后指令模式会附上过滤好的候选清单；关=完全按 Kira 原文让 AI 自行查找 |
-| LegacyCommentUseWhitelist | **好友动态接口不可用时用白名单兜底**（逐个拉取该接口稳定的好友说说） |
 | QzoneBlacklist / QzoneWhitelist | 黑白名单QQ，逗号分隔 |
 | BlackoutSchedules | 定时任务黑名单时间段，如 `00:00-06:00`（支持跨天，只管定时任务） |
 | ImageManifestEnabled / ImageManifestCount | 近期图片清单总开关 / 数量 |
@@ -98,12 +100,10 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 | **ImageDescOnManifestRequest** | 【默认开】AI 主动要清单时是否顺意识图（关=严格只列已识别；**这是 Alife 下清单能有内容的主要来源**） |
 | **ImageDescPrefetchOnArrival** | 【默认关】图片一到就后台识图（清单更快有内容，但每张图都烧一次 VLM；默认策略是「AI 主动才识图」） |
 | QzoneImageDescEnabled / QzoneImageDescOwn | 图片识图开关/允许识自己图 |
-| AutoCommentImageDesc | 后台自动评论前先识别对方配图 |
-| AutoPublishGroupId / AutoPublishUserId | 后台直接生成模式的消息来源群号/QQ号 |
-| AutoPublishImageProb / Min / Max | 自动发布配图概率/最少/最多张数（抽到0=AI自主） |
-| AutoPublishImageFallback / AutoPublishImageDedupeInterval | 非法选图兜底 / 配图去重窗口（默认3d，仅成功后记录） |
+| AutoPublishImageMin / AutoPublishImageMax | 发布任务随机配图目标的下限/上限（抽到 0 = AI 自主决定） |
+| AutoPublishImageDedupeInterval | 配图去重窗口（默认 3d，仅发布成功后记录） |
 | CommentVerify | 评论提交后回读确认（诊断模式，仅日志） |
-| TaskGroupIds / TaskPrivateIds | 定时任务指令场合（群号/QQ号，逗号分隔，随机选一个）；**留空=后台模式，无 AI 引导** |
+| TaskGroupIds / TaskPrivateIds | **指令锚点（可选）**：群号/QQ号，逗号分隔，随机选一个；指令会带「当前场合」（仅发布任务）。不填也照常执行 |
 | TaskMessageStyle | silent=提示AI不向群/私聊发回复（无痕）；notify=不限制 |
 | AutoAttachRecentImage | 吸附模式：发说说未指定图片时自动抓最近一张图（开启则清单机制关闭） |
 | AllowInsecureSsl | 忽略SSL证书校验：QQ空间接口报SSL连接错误时开启（多为本机代理/VPN/抓包拦截HTTPS），有安全风险谨慎开启 |
@@ -123,6 +123,25 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 - `QzoneImageManifest`：获取近期图片清单（只列已识别的图）
 
 ## 更新日志
+
+### 4.6.0
+
+**AI 指令模式唯一化 + 结构性告别老端点**（用户决策：AI 优先、不做降级切换、legacy 删除）
+
+- **默认且唯一路径 = AI 指令模式**：插件把任务指令注入会话，由 AI 以完整人设/记忆执行（Kira 原文引导 ✓）
+- **`任务群ID / 任务私聊ID` = 指令锚点**（保留，语义不变）：填了则指令带「当前场合」（发布任务，与 Kira 一致 ✓）；
+  **不填也照常执行**（不再像 Kira 那样静默不执行 ✓），只在需要场合时打一条配置建议
+- **删除"后台直接生成"三套路径**（发布/评论/回复，约 220 行）及其专用配置 **8 项**
+  （AutoPublishGroupId、AutoPublishUserId、AutoPublishImageProb、AutoPublishImageFallback、
+   MaxCommentsPerCycle、MaxRepliesPerCycle、AutoCommentImageDesc、LegacyCommentUseWhitelist）
+  ⇒ 老配置文件里多余的键会被忽略，**不会报错** ✓
+- **★ 好友动态数据源换到稳定接口**：不再调用 `feeds3_html_more`（返回 JS 对象字面量的老端点，历次脏数据来源），
+  改为用 **`emotion_cgi_msglist_v6`**（与评论同族）逐个拉「最近互动过的人（私聊）+ 白名单」的说说
+  ⇒ **结构性杜绝**那一整类问题（4.5.x 的容错全部保留，作为其它端点的保险）
+- **保留**：4.5.x 全部解析容错、已评论记录（跨重启）、配图去重、并发安全、任务互斥、工具名适配、
+  `（我）`标记 + 自身 uin 告知、`silent` 风格、`wantImages` 闸、清单按需注入（默认**只在发布任务那一轮**）
+- 自检：真值表 **88/88 通过**（新增 J 组 9 项：老端点彻底移除、无锚点仍注入、发布带场合、评论不带场合、
+  **清单只在发布任务那一轮可注入**）
 
 ### 4.5.5
 
