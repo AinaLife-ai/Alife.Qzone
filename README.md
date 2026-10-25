@@ -124,6 +124,24 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 
 ## 更新日志
 
+<details>
+<summary>点开查看历史版本（默认折叠）</summary>
+
+### 4.6.1（2026-10-24）
+
+**适配 Alife 5.1（修复编译失败）**
+
+- **`IVisionModel` 命名空间迁移**：5.1 起该接口从 `Alife.Function.AIModelUtility` 移到 **`Alife.Function.Vision`**
+  ⇒ 插件此前报 `CS0246: IVisionModel 找不到`（连带 `CS0019`、`CS1061` 两处级联错误），现已修正 `using` 与 `manifest` 依赖。
+- **5.1 兼容性逐项核对**（对照 `57bee71`）：
+  | 依赖 | 状态 |
+  |---|---|
+  | `IVisionModel` / `QueryAsync` | **命名空间已迁移**（本次修复）；方法签名未变 ✓ |
+  | `XmlFunctionCaller.RegisterHandler` / `DocumentMode` | 未变 ✓（`DocumentMode.cs` 文件级一致） |
+  | `[XmlFunction]` / `[Description]` / 参数匹配 | 仅去掉 `.ToLower()`（匹配本就大小写不敏感）⇒ 无影响 ✓ |
+  | `QChatService` / `OneBotClient` / `Interactor` / `ChatBehaviour` | 未变 ✓ |
+- 自检：真值表 **88/88 通过**。
+
 ### 4.6.0
 
 **AI 指令模式唯一化 + 结构性告别老端点**（用户决策：AI 优先、不做降级切换、legacy 删除）
@@ -271,3 +289,5 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 
 **自检**：50 项真值表全通过；**反向验证**（同一批症状断言跑在 4.4.0 上）**5/5 精确变红**，
 其中包含「清单每轮挂载」的原行为复现。
+
+</details>

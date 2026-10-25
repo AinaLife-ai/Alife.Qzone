@@ -11,7 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Alife.Foundation;
 using Alife.Framework;
-using Alife.Function.AIModelUtility;
+using Alife.Function.Vision;   // 5.1 起 IVisionModel 从 AIModelUtility 迁到这里
 using Alife.Function.FunctionCaller;
 using Alife.Function.QChat;
 using Microsoft.Extensions.Logging;
