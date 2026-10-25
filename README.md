@@ -127,9 +127,9 @@ QQ空间插件（完整移植并对齐 [KiraAI_qzone_plugin](https://github.com/
 <details>
 <summary>点开查看历史版本（默认折叠）</summary>
 
-### 4.6.1（2026-10-24）
+### 5.0.0（2026-10-24）
 
-**适配 Alife 5.1（修复编译失败）**
+**版本号对齐框架 5.x（与官方插件一致）+ 适配 Alife 5.1（修复编译失败）**
 
 - **`IVisionModel` 命名空间迁移**：5.1 起该接口从 `Alife.Function.AIModelUtility` 移到 **`Alife.Function.Vision`**
   ⇒ 插件此前报 `CS0246: IVisionModel 找不到`（连带 `CS0019`、`CS1061` 两处级联错误），现已修正 `using` 与 `manifest` 依赖。
